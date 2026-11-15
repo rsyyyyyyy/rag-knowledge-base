@@ -1,0 +1,96 @@
+# 依赖目录
+node_modules/
+backend/venv/
+
+# 日志文件
+*.log
+logs/
+
+# 环境变量文件
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# 编译输出目录
+dist/
+build/
+out/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# IDE 配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# 数据库文件
+*.db
+*.sqlite3
+*.sqlite
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 测试覆盖率
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# 本地配置文件
+config.local.js
+config.local.ts
+local.settings.json
+
+# 敏感信息文件
+*.pem
+*.key
+*.cert
+secrets.json
+credentials.json
+
+# 上传的文件（可选，如果需要保留示例文件可以注释掉）
+# backend/data/uploads/
+# backend/data/documents.json
+
+# 缓存文件
+.cache/
+*.cache
+
+# 备份文件
+*.bak
+*.backup
+*~
+
+# 其他
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+
+# Local knowledge base files
+/backend/data/
