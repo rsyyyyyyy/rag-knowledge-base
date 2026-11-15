@@ -2,8 +2,19 @@ import React, { useState, useEffect, useRef } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, message } from 'antd';
-import { chat, chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import { chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remend, { isWithinCodeBlock } from 'remend';
+
+
+function formatStreamingMarkdown(content: string) {
+  const markdown = remend(content, { katex: false });
+  // A chunk can end immediately after the opening bold marker.
+  return isWithinCodeBlock(markdown, markdown.length - 1)
+    ? markdown
+    : markdown.replace(/(^|\s)\*\*$/, '$1');
+}
 
 
 interface Source {
@@ -71,7 +82,6 @@ function App() {
   const [showCommandHint, setShowCommandHint] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('DeepSeek-V3 Pro');
   const [tokenUsage, setTokenUsage] = useState(0);
   const [ragEnabled, setRagEnabled] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -129,6 +139,9 @@ function App() {
   const [filterType, setFilterType] = useState('all'); // 筛选类型：all, recent, favorite
   const [activeFilter, setActiveFilter] = useState('all'); // 当前激活的筛选
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followChatRef = useRef(true);
+  const chatInFlightRef = useRef(false);
   const docxContainerRef = useRef<HTMLDivElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -202,7 +215,7 @@ function App() {
     setSummaryLoading(true);
     setSummaryError(null);
     try {
-      const response = await generateDocumentSummary(selectedDocument.id, 'Qwen (千问)');
+      const response = await generateDocumentSummary(selectedDocument.id);
       setSummary(response.summary);
       message.success('文档总结生成成功');
     } catch (error) {
@@ -792,46 +805,71 @@ function App() {
     e.target.style.height = `${e.target.scrollHeight}px`;
   };
 
-  const handleInputKeyDown = async (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      const question = inputValue.trim();
-      if (question) {
-        setInputValue('');
-        setShowCommandHint(false);
-        setIsLoading(true);
+  const sendQuestion = async (text: string) => {
+    const question = text.trim();
+    if (!question || isLoading || chatInFlightRef.current) return;
 
-        const attText = chatAttachment?.text;
-        const attName = chatAttachment?.filename;
-        const displayContent = attName ? `${question}\n📎 附件：${attName}` : question;
-        setChatAttachment(null);
+    chatInFlightRef.current = true;
+    followChatRef.current = true;
+    setInputValue('');
+    setShowCommandHint(false);
+    setIsLoading(true);
 
-        setMessages(prev => [...prev, { role: 'user', content: displayContent }]);
+    const attachment = chatAttachment;
+    const displayContent = attachment ? `${question}\n📎 附件：${attachment.filename}` : question;
+    const replyId = Date.now();
+    setChatAttachment(null);
+    setMessages(previous => [
+      ...previous,
+      { role: 'user', content: displayContent },
+      { id: replyId, role: 'assistant', content: '', complete: false },
+    ]);
 
-        try {
-          const response = await chat(question, 20, selectedModel, ragEnabled, attText, attName);
-
-          if (response.token_usage) {
-            setTokenUsage(prev => prev + (response.token_usage || 0));
-          }
-
-          setMessages(prev => [...prev, {
-            role: 'assistant',
-            content: response.answer,
-            sources: response.sources
-          }]);
-        } catch (error) {
-          console.error('Error sending message:', error);
-          setMessages(prev => [...prev, {
-            role: 'assistant',
-            content: '抱歉，处理您的请求时出错，请稍后重试。'
-          }]);
-        } finally {
-          setIsLoading(false);
-        }
-      }
+    try {
+      await chatStream(
+        question,
+        20,
+        ragEnabled,
+        chunk => {
+          setMessages(previous => previous.map(reply =>
+            reply.id === replyId ? { ...reply, content: reply.content + chunk } : reply
+          ));
+        },
+        (sources, tokenUsage) => {
+          setMessages(previous => previous.map(reply =>
+            reply.id === replyId ? { ...reply, complete: true, sources } : reply
+          ));
+          setTokenUsage(previous => previous + tokenUsage);
+        },
+        attachment?.text,
+        attachment?.filename,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '问答请求失败，请稍后重试。';
+      setMessages(previous => previous.map(reply =>
+        reply.id === replyId
+          ? { ...reply, content: reply.content ? `${reply.content}\n\n${detail}` : detail, complete: true }
+          : reply
+      ));
+    } finally {
+      chatInFlightRef.current = false;
+      setIsLoading(false);
     }
   };
+
+  const handleInputKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void sendQuestion(inputValue);
+    }
+  };
+
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (container && followChatRef.current) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }, [messages]);
 
   // 初始化时自动调整textarea高度
   useEffect(() => {
@@ -852,25 +890,9 @@ function App() {
           <h1 className="text-lg font-bold tracking-tight">NexusMind <span className="text-xs font-normal text-gray-400 bg-gray-100 dark:bg-slate-800 px-1.5 py-0.5 rounded ml-2">v2.1 Beta</span></h1>
         </div>
         <div className="flex items-center space-x-6">
-          {/* 模型切换 */}
           <div className="flex items-center space-x-2 bg-gray-100 dark:bg-slate-800 px-3 py-1.5 rounded-full shadow-sm">
-            {selectedModel === 'DeepSeek-V3 Pro' && <Icon icon="simple-icons:deepseek" className="text-brand-500" />}
-            {selectedModel === 'GLM-4 (智谱AI)' && <Icon icon="solar:brain-bold" className="text-brand-500" />}
-            {selectedModel === 'GPT-4o (Research)' && <Icon icon="solar:rocket-bold" className="text-brand-500" />}
-            {selectedModel === 'Llama-3-70B (Local)' && <Icon icon="solar:server-bold" className="text-brand-500" />}
-            {selectedModel === 'Qwen (千问)' && <Icon icon="solar:star-bold" className="text-brand-500" />}
-            <select
-              className="bg-transparent text-sm font-medium focus:outline-none cursor-pointer"
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-            >
-              <option>DeepSeek-V3 Pro</option>
-              <option>GLM-4 (智谱AI)</option>
-              <option>GPT-4o (Research)</option>
-              <option>Llama-3-70B (Local)</option>
-              <option>Qwen (千问)</option>
-            </select>
-            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" title="模型运行正常"></div>
+            <Icon icon="simple-icons:deepseek" className="text-brand-500" />
+            <span className="text-sm font-medium">DeepSeek Flash</span>
           </div>
           {/* 技术感知：向量库状态 */}
           <div className="hidden md:flex items-center space-x-4 border-l border-gray-200 dark:border-slate-800 pl-6">
@@ -997,7 +1019,14 @@ function App() {
           {activeTab === 'ask' && (
             <div className="flex-1 flex flex-col h-full">
               {/* 消息展示区 */}
-              <div className="flex-1 overflow-y-auto p-6 md:px-20 space-y-8 hide-scrollbar">
+              <div
+                ref={chatScrollRef}
+                className="flex-1 overflow-y-auto p-6 md:px-20 space-y-8 hide-scrollbar"
+                onScroll={event => {
+                  const { scrollHeight, scrollTop, clientHeight } = event.currentTarget;
+                  followChatRef.current = scrollHeight - scrollTop - clientHeight <= 48;
+                }}
+              >
                 {messages.length === 0 ? (
                   /* 欢迎语 */
                   <div className="py-12 flex flex-col items-center text-center space-y-4">
@@ -1011,49 +1040,7 @@ function App() {
                         <button
                           key={question.id}
                           className="p-3 border border-gray-200 dark:border-slate-800 rounded-xl hover:bg-brand-50 dark:hover:bg-brand-900/20 transition-all group"
-                          onClick={() => {
-                            setInputValue(question.content);
-                            // 自动发送消息
-                            const questionText = question.content;
-                            setInputValue('');
-                            setShowCommandHint(false);
-                            setIsLoading(true);
-
-                            // 添加用户消息
-                            setMessages(prev => [...prev, { role: 'user', content: questionText }]);
-
-                            try {
-                              // 调用后端API
-                              chat(questionText, 20, selectedModel, ragEnabled).then(response => {
-                                // 更新token使用量
-                                if (response.token_usage) {
-                                  setTokenUsage(prev => prev + (response.token_usage || 0));
-                                }
-
-                                // 添加AI响应
-                                setMessages(prev => [...prev, {
-                                  role: 'assistant',
-                                  content: response.answer,
-                                  sources: response.sources
-                                }]);
-                              }).catch(error => {
-                                console.error('Error sending message:', error);
-                                setMessages(prev => [...prev, {
-                                  role: 'assistant',
-                                  content: '抱歉，处理您的请求时出错，请稍后重试。'
-                                }]);
-                              }).finally(() => {
-                                setIsLoading(false);
-                              });
-                            } catch (error) {
-                              console.error('Error sending message:', error);
-                              setMessages(prev => [...prev, {
-                                role: 'assistant',
-                                content: '抱歉，处理您的请求时出错，请稍后重试。'
-                              }]);
-                              setIsLoading(false);
-                            }
-                          }}
+                          onClick={() => void sendQuestion(question.content)}
                         >
                           <p className="text-xs font-semibold text-brand-600 mb-1">{question.title}</p>
                           <p className="text-sm text-gray-600 dark:text-slate-400">{question.content}</p>
@@ -1073,17 +1060,15 @@ function App() {
                       <div className={`space-y-4 flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`text-slate-800 dark:text-slate-200 leading-relaxed text-sm ${message.role === 'user' ? 'bg-gray-100 dark:bg-slate-800 p-4 rounded-xl' : ''}`}>
                           {message.role === 'assistant' ? (
-                            message.complete ? (
-                              <div className="prose dark:prose-invert max-w-none">
-                                <ReactMarkdown>
-                                  {message.content}
+                            <div className="chat-markdown">
+                              {message.complete === false && !message.content ? (
+                                <p className="typing-cursor">正在思考...</p>
+                              ) : (
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                  {message.complete === false ? formatStreamingMarkdown(message.content) : message.content}
                                 </ReactMarkdown>
-                              </div>
-                            ) : (
-                              <div className="whitespace-pre-wrap">
-                                {message.content}
-                              </div>
-                            )
+                              )}
+                            </div>
                           ) : (
                             message.content
                           )}
@@ -1111,7 +1096,7 @@ function App() {
                 )}
 
                 {/* 加载状态 */}
-                {isLoading && (
+                {isLoading && messages.at(-1)?.complete !== false && (
                   <div className="flex space-x-4 max-w-4xl">
                     <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center shrink-0">
                       <Icon icon="solar:magic-stick-3-bold" className="text-white" />
@@ -1189,72 +1174,9 @@ function App() {
                       </button>
                       <button
                         className="p-2 bg-brand-600 text-white rounded-xl shadow-lg shadow-brand-200 hover:bg-brand-700 transition-all group transform hover:scale-105"
-                        onClick={() => {
-                          const question = inputValue.trim();
-                          if (question) {
-                            setInputValue('');
-                            setShowCommandHint(false);
-                            setIsLoading(true);
-
-                            const attText = chatAttachment?.text;
-                            const attName = chatAttachment?.filename;
-                            const displayContent = attName ? `${question}\n📎 附件：${attName}` : question;
-                            setChatAttachment(null);
-
-                            setMessages(prev => [...prev, { role: 'user', content: displayContent }]);
-
-                            const aiMessageId = Date.now();
-                            setMessages(prev => [...prev, {
-                              id: aiMessageId,
-                              role: 'assistant',
-                              content: '',
-                              sources: [],
-                              complete: false
-                            }]);
-
-                            try {
-                              chatStream(
-                                question,
-                                20,
-                                selectedModel,
-                                ragEnabled,
-                                (chunk) => {
-                                  setMessages(prev => prev.map(msg =>
-                                    msg.id === aiMessageId
-                                      ? { ...msg, content: msg.content + chunk }
-                                      : msg
-                                  ));
-                                },
-                                () => {
-                                  setMessages(prev => prev.map(msg =>
-                                    msg.id === aiMessageId
-                                      ? { ...msg, complete: true }
-                                      : msg
-                                  ));
-                                  setIsLoading(false);
-                                },
-                                attText,
-                                attName,
-                              ).catch(error => {
-                                console.error('Error sending message:', error);
-                                setMessages(prev => prev.map(msg =>
-                                  msg.id === aiMessageId
-                                    ? { ...msg, content: '抱歉，处理您的请求时出错，请稍后重试。', complete: true }
-                                    : msg
-                                ));
-                                setIsLoading(false);
-                              });
-                            } catch (error) {
-                              console.error('Error sending message:', error);
-                              setMessages(prev => prev.map(msg =>
-                                msg.id === aiMessageId
-                                  ? { ...msg, content: '抱歉，处理您的请求时出错，请稍后重试。', complete: true }
-                                  : msg
-                              ));
-                              setIsLoading(false);
-                            }
-                          }
-                        }}
+                        aria-label="发送消息"
+                        disabled={isLoading || !inputValue.trim()}
+                        onClick={() => void sendQuestion(inputValue)}
                       >
                         <Icon icon="solar:send-bold" className="text-xl group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
                       </button>

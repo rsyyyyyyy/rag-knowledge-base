@@ -157,25 +157,15 @@ export const parseFileOnly = async (file: File): Promise<{ filename: string; siz
 export const chat = async (
   question: string,
   top_k: number = 3,
-  model: string = 'gpt-3.5-turbo',
   rag_enabled: boolean = true,
   attachmentText?: string,
   attachmentFilename?: string,
 ): Promise<ChatResponse> => {
-  const modelMap: Record<string, string> = {
-    'DeepSeek-V3 Pro': 'gpt-4o-mini',
-    'GLM-4 (智谱AI)': 'gpt-4o-mini',
-    'GPT-4o (Research)': 'gpt-4o',
-    'Llama-3-70B (Local)': 'gpt-4o-mini',
-    'Qwen (千问)': 'gpt-4o-mini',
-  };
-
-  const actualModel = modelMap[model] || model;
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
   if (attachmentText) body.attachment_text = attachmentText;
   if (attachmentFilename) body.attachment_filename = attachmentFilename;
 
-  const response = await fetch(`${API_BASE_URL}/chat?model=${encodeURIComponent(actualModel)}&rag_enabled=${rag_enabled}`, {
+  const response = await fetch(`${API_BASE_URL}/chat?rag_enabled=${rag_enabled}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -184,7 +174,8 @@ export const chat = async (
   });
 
   if (!response.ok) {
-    throw new Error('Failed to chat');
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error?.detail || '问答请求失败，请稍后重试');
   }
 
   return response.json();
@@ -194,27 +185,17 @@ export const chat = async (
 export const chatStream = async (
   question: string,
   top_k: number = 3,
-  model: string = 'gpt-3.5-turbo',
   rag_enabled: boolean = true,
   onChunk: (chunk: string) => void,
-  onComplete: () => void,
+  onComplete: (sources: Source[], tokenUsage: number) => void,
   attachmentText?: string,
   attachmentFilename?: string,
 ): Promise<void> => {
-  const modelMap: Record<string, string> = {
-    'DeepSeek-V3 Pro': 'gpt-4o-mini',
-    'GLM-4 (智谱AI)': 'gpt-4o-mini',
-    'GPT-4o (Research)': 'gpt-4o',
-    'Llama-3-70B (Local)': 'gpt-4o-mini',
-    'Qwen (千问)': 'gpt-4o-mini',
-  };
-
-  const actualModel = modelMap[model] || model;
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
   if (attachmentText) body.attachment_text = attachmentText;
   if (attachmentFilename) body.attachment_filename = attachmentFilename;
 
-  const response = await fetch(`${API_BASE_URL}/chat?model=${encodeURIComponent(actualModel)}&rag_enabled=${rag_enabled}&stream=true`, {
+  const response = await fetch(`${API_BASE_URL}/chat?rag_enabled=${rag_enabled}&stream=true`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -234,6 +215,7 @@ export const chatStream = async (
 
   const decoder = new TextDecoder();
   let buffer = '';
+  let sources: Source[] = [];
 
   while (true) {
     const { done, value } = await reader.read();
@@ -246,22 +228,24 @@ export const chatStream = async (
     buffer = lines.pop() || '';
 
     for (const line of lines) {
-      if (line.trim()) {
-        try {
-          const data = JSON.parse(line);
-          if (data.type === 'text' && data.content) {
-            // 直接传递完整的文本块，而不是按字符分割
-            // 这样可以减少 ReactMarkdown 的渲染次数，提高性能
-            onChunk(data.content);
-          } else if (data.type === 'end') {
-            onComplete();
-          }
-        } catch (error) {
-          console.error('Error parsing stream data:', error);
-        }
+      if (!line.trim()) continue;
+
+      const data = JSON.parse(line);
+      if (data.type === 'text' && data.content) {
+        onChunk(data.content);
+      } else if (data.type === 'sources') {
+        sources = data.sources;
+      } else if (data.type === 'error') {
+        throw new Error(data.message);
+      } else if (data.type === 'end') {
+        await reader.cancel();
+        onComplete(sources, data.token_usage ?? 0);
+        return;
       }
     }
   }
+
+  throw new Error('问答响应意外中断，请重试');
 };
 
 // 文件夹相关API
@@ -520,11 +504,8 @@ export const toggleDocumentFavorite = async (docId: string, isFavorite: boolean)
 };
 
 // 文档智能总结
-export const generateDocumentSummary = async (docId: string, model: string = 'gpt-3.5-turbo'): Promise<{ document_id: string; filename: string; summary: string; model_used: string; token_usage: number }> => {
-  const params = new URLSearchParams();
-  params.append('model', model);
-
-  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(docId)}/summary?${params.toString()}`, {
+export const generateDocumentSummary = async (docId: string): Promise<{ document_id: string; filename: string; summary: string; model_used: string; token_usage: number }> => {
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(docId)}/summary`, {
     method: 'POST',
   });
 

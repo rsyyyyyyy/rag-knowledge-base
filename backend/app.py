@@ -7,8 +7,9 @@ import os
 import json
 from datetime import datetime
 from pathlib import Path
-import dashscope
-from dashscope import Generation, TextEmbedding
+from functools import lru_cache
+from fastembed import TextEmbedding
+from openai import APIError, APIStatusError, APITimeoutError, OpenAI
 from chromadb import EmbeddingFunction, Documents, Embeddings
 import zipfile
 import re
@@ -16,8 +17,28 @@ from urllib.parse import quote
 import PyPDF2
 from docx import Document
 
-# 配置千问大模型API密钥
-dashscope.api_key = os.environ["DASHSCOPE_API_KEY"]
+DEEPSEEK_MODEL = "deepseek-flash"
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+
+
+def get_deepseek_client():
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="未配置 DeepSeek API 密钥（DEEPSEEK_API_KEY）")
+    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com", timeout=60.0, max_retries=0)
+
+
+def deepseek_error(error: APIError) -> HTTPException:
+    if isinstance(error, APIStatusError):
+        if error.status_code == 401:
+            return HTTPException(status_code=502, detail="DeepSeek API 密钥无效或已撤销")
+        if error.status_code == 402:
+            return HTTPException(status_code=502, detail="DeepSeek API 账户余额不足")
+        if error.status_code == 429:
+            return HTTPException(status_code=503, detail="DeepSeek API 请求过于频繁，请稍后重试")
+    if isinstance(error, APITimeoutError):
+        return HTTPException(status_code=504, detail="DeepSeek API 请求超时，请稍后重试")
+    return HTTPException(status_code=502, detail="DeepSeek API 暂时不可用，请稍后重试")
 
 app = FastAPI()
 
@@ -41,91 +62,46 @@ FOLDER_META_FILE = DATA_DIR / "folders.json"
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".doc", ".docx"}
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
-class DashscopeEmbedding(EmbeddingFunction):
-    """使用 dashscope text-embedding-v3 生成向量，无需 onnxruntime"""
+@lru_cache(maxsize=1)
+def get_embedding_model() -> TextEmbedding:
+    return TextEmbedding(model_name=EMBEDDING_MODEL)
 
-    MAX_RETRIES = 3
-    RETRY_DELAY = 2  # seconds
+
+class LocalEmbedding(EmbeddingFunction):
+    @staticmethod
+    def name() -> str:
+        return "local_bge_small_zh_v15"
 
     def __call__(self, input: Documents) -> Embeddings:
-        import time
-        BATCH = 6  # Dashscope text-embedding-v3 限制每次最多 10 条，留余量设为 6
-        all_embeddings: Embeddings = []
-        for i in range(0, len(input), BATCH):
-            batch = input[i:i + BATCH]
-            success = False
-            for attempt in range(1, self.MAX_RETRIES + 1):
-                try:
-                    resp = TextEmbedding.call(
-                        model="text-embedding-v3",
-                        input=batch,
-                        dimension=512,
-                    )
-                    if resp.status_code == 200:
-                        sorted_embs = sorted(resp.output["embeddings"], key=lambda x: x["text_index"])
-                        all_embeddings.extend([e["embedding"] for e in sorted_embs])
-                        success = True
-                        break
-                    else:
-                        print(f"[Embedding] API error (attempt {attempt}/{self.MAX_RETRIES}): "
-                              f"status={resp.status_code}, message={getattr(resp, 'message', 'unknown')}")
-                        if attempt < self.MAX_RETRIES:
-                            time.sleep(self.RETRY_DELAY * attempt)
-                except Exception as e:
-                    print(f"[Embedding] Exception (attempt {attempt}/{self.MAX_RETRIES}): {e}")
-                    if attempt < self.MAX_RETRIES:
-                        time.sleep(self.RETRY_DELAY * attempt)
+        return list(get_embedding_model().embed(input))
 
-            if not success:
-                print(f"[Embedding] FAILED after {self.MAX_RETRIES} retries for batch starting at index {i}, "
-                      f"text preview: {batch[0][:80] if batch else 'empty'}...")
-                raise RuntimeError(
-                    f"Dashscope embedding API failed after {self.MAX_RETRIES} retries. "
-                    f"Check API key and network connection."
-                )
-        return all_embeddings
+    def embed_query(self, input: Documents) -> Embeddings:
+        return list(get_embedding_model().query_embed(input))
 
 
-# 初始化 ChromaDB（持久化存储，重启不丢数据）
+# 向量模型改变后使用新的集合，避免将不同模型生成的向量混用。
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-dashscope_ef = DashscopeEmbedding()
-COLLECTION_NAME = "knowledge_base_v3"
+local_embedding = LocalEmbedding()
+COLLECTION_NAME = "knowledge_base_bge_small_zh_v15"
 
-import shutil
 
 def _init_chromadb():
-    """初始化 ChromaDB，索引损坏时自动重建"""
     global client, collection
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
-        client.delete_collection("knowledge_base_v2")
-    except Exception:
-        pass
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=dashscope_ef,
-        metadata={"hnsw:space": "cosine"},
-    )
-    try:
-        collection.count()
-        print(f"[ChromaDB] Collection '{COLLECTION_NAME}' loaded, {collection.count()} chunks")
-    except Exception as e:
-        print(f"[ChromaDB] Index corrupted: {e}")
-        print("[ChromaDB] Deleting corrupted data and rebuilding...")
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
-        if CHROMA_DIR.exists():
-            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=dashscope_ef,
+            name=COLLECTION_NAME, embedding_function=local_embedding,
             metadata={"hnsw:space": "cosine"},
         )
-        print("[ChromaDB] Fresh collection created, will re-index on startup")
+        print(f"[ChromaDB] Collection '{COLLECTION_NAME}' loaded, {collection.count()} chunks")
+    except Exception as error:
+        print(f"[ChromaDB] Rebuilding collection '{COLLECTION_NAME}': {error}")
+        client.delete_collection(COLLECTION_NAME)
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME, embedding_function=local_embedding,
+            metadata={"hnsw:space": "cosine"},
+        )
+
 
 _init_chromadb()
 
@@ -358,7 +334,7 @@ def _resolve_doc_path(doc: dict) -> Path | None:
     """解析文档的实际文件路径，兼容项目迁移后路径变化的情况"""
     meta = doc.get("metadata", {})
     original = Path(meta.get("path", ""))
-    if original.exists():
+    if original.is_file():
         return original
     # 项目可能已迁移，尝试从当前 UPLOADS_DIR 中查找
     doc_id = doc.get("id", "")
@@ -381,8 +357,8 @@ def _reindex_missing_documents() -> None:
             if meta and "doc_id" in meta:
                 doc_id_in_db = meta["doc_id"]
                 existing_ids_in_chroma.add(doc_id_in_db)
-                emb = all_data["embeddings"][i] if all_data.get("embeddings") else None
-                if emb and all(v == 0.0 for v in emb):
+                emb = all_data["embeddings"][i] if all_data.get("embeddings") is not None else None
+                if emb is not None and all(v == 0.0 for v in emb):
                     zero_vector_doc_ids.add(doc_id_in_db)
     except Exception as e:
         print(f"[startup] Warning: failed to read ChromaDB: {e}")
@@ -836,9 +812,8 @@ async def retrieve_documents(request: QueryRequest):
 
 # 智能问答（RAG）
 @app.post("/api/chat")
-async def chat(
+def chat(
     request: QueryRequest,
-    model: str = Query(default="Qwen (千问)", description="Model to use for chat"),
     rag_enabled: bool = Query(default=True, description="Whether to use RAG"),
     stream: bool = Query(default=False, description="Whether to stream the response"),
 ):
@@ -918,62 +893,61 @@ async def chat(
             {"role": "user", "content": user_message},
         ]
 
-        if stream:
-            def generate():
-                try:
-                    response = Generation.call(
-                        model="qwen-plus",
-                        messages=messages,
-                        result_format="message",
-                        stream=True,
-                        incremental_output=True,
-                        max_tokens=4000,
-                        temperature=0.7,
-                    )
-                    for chunk in response:
-                        if (hasattr(chunk, 'output')
-                                and chunk.output.choices
-                                and chunk.output.choices[0].message.content):
-                            text = chunk.output.choices[0].message.content
-                            yield json.dumps({"type": "text", "content": text}) + "\n"
-                except Exception as e:
-                    yield json.dumps({"type": "text", "content": f"\n\n[错误] {e}"}) + "\n"
-                if sources:
-                    yield json.dumps({"type": "sources", "sources": sources}) + "\n"
-                yield json.dumps({"type": "end"}) + "\n"
-
-            return StreamingResponse(generate(), media_type="text/event-stream")
-        else:
-            response = Generation.call(
-                model="qwen-plus",
+        deepseek = get_deepseek_client()
+        try:
+            response = deepseek.chat.completions.create(
+                model=DEEPSEEK_MODEL,
                 messages=messages,
-                result_format="message",
+                stream=stream,
+                stream_options={"include_usage": True} if stream else None,
                 max_tokens=4000,
                 temperature=0.7,
+                extra_body={"thinking": {"type": "disabled"}},
             )
-            answer = ""
-            if hasattr(response, 'output') and response.output.choices:
-                answer = response.output.choices[0].message.content or ""
-            token_usage = 0
-            if hasattr(response, 'usage') and hasattr(response.usage, 'total_tokens'):
-                token_usage = response.usage.total_tokens
+        except APIError as error:
+            deepseek.close()
+            raise deepseek_error(error) from error
 
-            return {
-                "answer": answer,
-                "sources": sources,
-                "model_used": model,
-                "token_usage": token_usage,
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if stream:
+            def generate():
+                token_usage = 0
+                try:
+                    with response:
+                        for chunk in response:
+                            if chunk.usage:
+                                token_usage = chunk.usage.total_tokens
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                yield json.dumps({"type": "text", "content": chunk.choices[0].delta.content}) + "\n"
+                except APIError as error:
+                    yield json.dumps({"type": "error", "message": deepseek_error(error).detail}) + "\n"
+                    return
+                finally:
+                    deepseek.close()
+                if sources:
+                    yield json.dumps({"type": "sources", "sources": sources}) + "\n"
+                yield json.dumps({"type": "end", "token_usage": token_usage}) + "\n"
 
+            return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+        deepseek.close()
+        answer = response.choices[0].message.content if response.choices else None
+        if not answer:
+            raise HTTPException(status_code=502, detail="DeepSeek 未返回有效回答，请重试")
+        return {
+            "answer": answer,
+            "sources": sources,
+            "model_used": DEEPSEEK_MODEL,
+            "token_usage": response.usage.total_tokens if response.usage else 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"[chat] {type(error).__name__}: {error}")
+        raise HTTPException(status_code=500, detail="知识库问答处理失败，请检查后端日志") from error
 
 # 文档智能总结
 @app.post("/api/documents/{doc_id}/summary")
-async def generate_document_summary(
-    doc_id: str,
-    model: str = Query(default="gpt-3.5-turbo", description="Model to use for summary")
-):
+def generate_document_summary(doc_id: str):
     try:
         docs = load_documents_meta()
         target = next((d for d in docs if d.get("id") == doc_id), None)
@@ -1019,24 +993,29 @@ async def generate_document_summary(
 
 总结："""
 
-        # 调用千问大模型生成总结
-        response = Generation.call(
-            model="qwen-plus",
-            prompt=prompt,
-            max_tokens=300,
-            temperature=0.5,
-        )
+        try:
+            with get_deepseek_client() as deepseek:
+                response = deepseek.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=300,
+                    temperature=0.5,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+        except APIError as error:
+            raise deepseek_error(error) from error
 
-        summary = response.output.text if hasattr(response, 'output') and hasattr(response.output, 'text') else ""
-        # 处理星号和其他特殊符号
-        summary = summary.replace('*', '').strip()
-        token_usage = response.usage.total_tokens if hasattr(response, 'usage') and hasattr(response.usage, 'total_tokens') else 0
+        summary = response.choices[0].message.content if response.choices else None
+        if not summary:
+            raise HTTPException(status_code=502, detail="DeepSeek 未返回有效摘要，请重试")
+        summary = summary.replace("*", "").strip()
+        token_usage = response.usage.total_tokens if response.usage else 0
 
         return {
             "document_id": doc_id,
             "filename": filename,
             "summary": summary,
-            "model_used": model,
+            "model_used": DEEPSEEK_MODEL,
             "token_usage": token_usage
         }
     except HTTPException:
@@ -1532,33 +1511,17 @@ async def clear_all_data():
 
 @app.get("/api/debug/embedding-test")
 async def debug_embedding_test():
-    """测试 Dashscope 嵌入 API 是否正常工作"""
-    test_text = "这是一段测试文本，用于验证嵌入API是否正常。"
+    """测试本地文本向量模型。"""
     try:
-        resp = TextEmbedding.call(
-            model="text-embedding-v3",
-            input=[test_text],
-            dimension=512,
-        )
-        if resp.status_code == 200:
-            emb = resp.output["embeddings"][0]["embedding"]
-            non_zero = sum(1 for x in emb if x != 0.0)
-            return {
-                "status": "ok",
-                "api_status_code": resp.status_code,
-                "embedding_dim": len(emb),
-                "non_zero_values": non_zero,
-                "sample_values": emb[:5],
-            }
-        else:
-            return {
-                "status": "error",
-                "api_status_code": resp.status_code,
-                "message": getattr(resp, "message", "unknown error"),
-                "code": getattr(resp, "code", "unknown"),
-            }
-    except Exception as e:
-        return {"status": "exception", "error": str(e)}
+        emb = local_embedding(["用于验证本地向量模型的测试文本"])[0]
+        return {
+            "status": "ok",
+            "model": EMBEDDING_MODEL,
+            "embedding_dim": len(emb),
+            "non_zero_values": sum(1 for value in emb if value != 0.0),
+        }
+    except Exception as error:
+        return {"status": "exception", "error": str(error)}
 
 
 @app.get("/api/debug/chroma-status")
@@ -1572,8 +1535,8 @@ async def debug_chroma_status():
             if doc_id not in doc_stats:
                 doc_stats[doc_id] = {"filename": meta.get("filename", "?"), "chunks": 0, "zero_vectors": 0}
             doc_stats[doc_id]["chunks"] += 1
-            emb = all_data["embeddings"][i] if all_data.get("embeddings") else None
-            if emb and all(v == 0.0 for v in emb):
+            emb = all_data["embeddings"][i] if all_data.get("embeddings") is not None else None
+            if emb is not None and all(v == 0.0 for v in emb):
                 doc_stats[doc_id]["zero_vectors"] += 1
         return {"collection": collection.name, "total_chunks": len(all_data.get("ids", [])), "documents": doc_stats}
     except Exception as e:
