@@ -3,6 +3,7 @@ import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, message } from 'antd';
 import type { Source } from './services/api';
+import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/OnlinePaperSearch';
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
 import { chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
@@ -86,6 +87,7 @@ function App() {
 
   const [activeTab, setActiveTab] = useState('ask');
   const [referenceFile, setReferenceFile] = useState<ReferenceFile | null>(null);
+  const citationSelection = useRef(0);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const [showCommandHint, setShowCommandHint] = useState(false);
@@ -94,7 +96,10 @@ function App() {
   const [tokenUsage, setTokenUsage] = useState(0);
   const [ragEnabled, setRagEnabled] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(false);
-  const [chatAttachment, setChatAttachment] = useState<{ filename: string; text: string } | null>(null);
+  const [chatAttachment, setChatAttachment] = useState<{
+    filename: string; text: string; basis?: OnlinePaperAttachment['basis']; sourceUrl?: string;
+  } | null>(null);
+  const [onlinePaperSearchOpen, setOnlinePaperSearchOpen] = useState(false);
   const [showAttachmentChoice, setShowAttachmentChoice] = useState(false);
   const [pendingAttachmentFile, setPendingAttachmentFile] = useState<File | null>(null);
   const [recommendedQuestions] = useState([
@@ -910,13 +915,17 @@ function App() {
           ));
         },
         (sources, tokenUsage) => {
+          const linkedSources = sources.map(source => source.id === 'attachment' && attachment?.basis
+            ? { ...source, attachmentBasis: attachment.basis, sourceUrl: attachment.sourceUrl }
+            : source);
           setMessages(previous => previous.map(reply =>
-            reply.id === replyId ? { ...reply, complete: true, sources } : reply
+            reply.id === replyId ? { ...reply, complete: true, sources: linkedSources } : reply
           ));
           setTokenUsage(previous => previous + tokenUsage);
         },
         attachment?.text,
         attachment?.filename,
+        attachment?.basis,
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : '问答请求失败，请稍后重试。';
@@ -1138,7 +1147,20 @@ function App() {
                               {message.complete === false && !message.content ? (
                                 <p className="typing-cursor">正在思考...</p>
                               ) : (
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                                  a: ({ href, children }) => {
+                                    const match = /^#evidence-(\d+)$/.exec(href ?? '');
+                                    if (!match) return <a href={href}>{children}</a>;
+                                    const source = message.sources?.find(item => item.citation_number === Number(match[1]));
+                                    if (!source) return <span>{children}</span>;
+                                    return <button type="button" className="px-0.5 text-brand-600 underline"
+                                      aria-label={`查看引用 ${match[1]}`}
+                                      onClick={() => setReferenceFile({
+                                        id: source.id, filename: source.filename, versionId: source.version_id,
+                                        selectionId: ++citationSelection.current, sources: [source],
+                                      })}>{children}</button>;
+                                  },
+                                }}>
                                   {message.complete === false ? formatStreamingMarkdown(message.content) : message.content}
                                 </ReactMarkdown>
                               )}
@@ -1215,6 +1237,11 @@ function App() {
                     >
                       <Icon icon="solar:paperclip-line-duotone" className="text-2xl" />
                     </button>
+                    <button type="button" title="联网找论文" aria-label="联网找论文" disabled={isLoading}
+                      className="shrink-0 p-2 text-gray-500 transition-colors hover:text-brand-600 disabled:opacity-50"
+                      onClick={() => setOnlinePaperSearchOpen(true)}>
+                      <Icon icon="solar:global-line-duotone" className="text-xl" />
+                    </button>
                     <textarea
                       ref={textareaRef}
                       className="w-full bg-transparent border-none focus:ring-0 text-sm py-2.5 max-h-32 hide-scrollbar resize-none font-medium"
@@ -1252,7 +1279,11 @@ function App() {
                       <div className="flex items-center space-x-2 min-w-0">
                         <Icon icon="solar:document-text-bold" className="text-brand-600 shrink-0" />
                         <span className="text-xs text-brand-700 dark:text-brand-300 truncate">📎 {chatAttachment.filename}</span>
-                        <span className="text-[10px] text-gray-400 shrink-0">（仅作为附件，不入库）</span>
+                        <span className="text-[10px] text-gray-500 shrink-0">
+                          {chatAttachment.basis === 'pdf' ? '开放 PDF' : chatAttachment.basis === 'abstract' ? '仅摘要' : '仅作为附件'}
+                        </span>
+                        {chatAttachment.sourceUrl && <a href={chatAttachment.sourceUrl} target="_blank" rel="noreferrer"
+                          className="shrink-0 text-xs text-brand-600 underline">来源</a>}
                       </div>
                       <button
                         className="text-gray-400 hover:text-red-500 transition-colors shrink-0 ml-2"
@@ -1264,6 +1295,9 @@ function App() {
                   )}
                   <p className="text-center text-[10px] text-gray-400 mt-2">使用 <kbd className="px-1 border rounded">Shift</kbd> + <kbd className="px-1 border rounded">Enter</kbd> 换行</p>
 
+                  <OnlinePaperSearch open={onlinePaperSearchOpen} onClose={() => setOnlinePaperSearchOpen(false)}
+                    onAttach={setChatAttachment}
+                    onImport={() => { void getDocuments().then(setDocuments).catch(() => {}); }} />
                   {/* 附件选择弹窗 */}
                   <Modal
                     title="选择附件用途"

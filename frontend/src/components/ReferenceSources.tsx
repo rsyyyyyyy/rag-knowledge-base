@@ -6,6 +6,7 @@ const PdfReferencePreview = lazy(() => import('./PdfReferencePreview'));
 
 export interface ReferenceFile {
   versionId?: string;
+  selectionId?: number;
   id: string;
   filename: string;
   sources: Source[];
@@ -49,16 +50,34 @@ function locateEvidence(text: string, sources: Source[]) {
   return { ranges: merged, unmatched };
 }
 
+function AttachmentPreview({ sources }: { sources: Source[] }) {
+  return <>
+    {sources.map((source, index) => (
+      <article key={index} className="mb-4 space-y-2 text-sm">
+        <p className="text-xs text-gray-500 dark:text-slate-400">
+          {source.attachmentBasis === 'abstract' ? '论文摘要'
+            : source.attachmentBasis === 'pdf' ? '本轮提供给模型的 PDF 提取文本' : '本轮提供给模型的附件文本'}
+        </p>
+        {source.sourceUrl && (
+          <a href={source.sourceUrl} target="_blank" rel="noopener noreferrer" className="inline-block text-brand-600 underline">
+            打开论文来源
+          </a>
+        )}
+        <p className="whitespace-pre-wrap break-words leading-relaxed">{source.excerpt || '暂无可显示的附件文本。'}</p>
+      </article>
+    ))}
+  </>;
+}
+
 function ReferencePreview({ file }: { file: ReferenceFile }) {
-  const isAttachment = file.id === 'attachment';
-  const [text, setText] = useState(isAttachment ? file.sources[0].excerpt : '');
-  const [loading, setLoading] = useState(!isAttachment && !file.versionId);
+  const [text, setText] = useState('');
+  const [loading, setLoading] = useState(!file.versionId);
   const [error, setError] = useState('');
   const firstHighlight = useRef<HTMLElement>(null);
   const { ranges, unmatched } = useMemo(() => locateEvidence(text, file.sources), [text, file.sources]);
 
   useEffect(() => {
-    if (isAttachment || file.versionId) return;
+    if (file.versionId) return;
 
     let active = true;
     getDocumentView(file.id).then(view => {
@@ -71,7 +90,7 @@ function ReferencePreview({ file }: { file: ReferenceFile }) {
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, [file.id, file.versionId, isAttachment]);
+  }, [file.id, file.versionId]);
 
   useEffect(() => {
     if (!loading && ranges.length) {
@@ -84,16 +103,14 @@ function ReferencePreview({ file }: { file: ReferenceFile }) {
   const highlightStyle = 'bg-yellow-200 text-slate-950';
   return (
     <>
-      {!isAttachment && (
-        <a
-          className="mb-4 inline-block text-brand-600 underline"
-          href={getDocumentFileUrl(file.id, file.versionId)}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          打开原文件
-        </a>
-      )}
+      <a
+        className="mb-4 inline-block text-brand-600 underline"
+        href={getDocumentFileUrl(file.id, file.versionId)}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        打开原文件
+      </a>
       {!!text && (
         <div className="whitespace-pre-wrap break-words text-sm leading-relaxed">
           {ranges.map((range, index) => (
@@ -124,6 +141,7 @@ function ReferencePreview({ file }: { file: ReferenceFile }) {
 function DocumentPreview({ file }: { file: ReferenceFile }) {
   const [pdfFailed, setPdfFailed] = useState(false);
   const handlePdfError = useCallback(() => setPdfFailed(true), []);
+  if (file.id === 'attachment') return <AttachmentPreview sources={file.sources} />;
   if (file.versionId && !pdfFailed) {
     return (
       <Suspense fallback={<p role="status">正在加载 PDF 预览…</p>}>
@@ -187,7 +205,7 @@ export function ReferencePanel({ file, onClose }: { file: ReferenceFile; onClose
         </button>
       </header>
       <div className="min-h-0 flex-1 overflow-auto p-4">
-        <DocumentPreview key={JSON.stringify([file.id, file.versionId, file.sources.map(source => source.chunk_id)])} file={file} />
+        <DocumentPreview key={JSON.stringify([file.id, file.versionId, file.selectionId, file.sources.map(source => source.chunk_id)])} file={file} />
       </div>
     </aside>
     </>

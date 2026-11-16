@@ -60,6 +60,7 @@ export interface RetrievedDocument extends Document {
 // 来源类型
 export interface Source {
   evidence_id?: string;
+  citation_number?: number;
   document_version_id?: string;
   version_id?: string;
   page_index?: number;
@@ -68,6 +69,8 @@ export interface Source {
   filename: string;
   chunk_id?: string;
   excerpt: string;
+  attachmentBasis?: 'pdf' | 'abstract';
+  sourceUrl?: string;
 }
 
 // 问答响应类型
@@ -212,6 +215,39 @@ export const chat = async (
 };
 
 // 流式智能问答
+export interface OnlinePaper {
+  id: string;
+  title: string;
+  year: number | null;
+  authors: string[];
+  doi: string | null;
+  source_url: string;
+  pdf_url: string | null;
+  can_download: boolean;
+  abstract: string;
+}
+
+async function onlinePaperRequest(path: string) {
+  const response = await fetch(`${API_BASE_URL}/online-papers${path}`);
+  if (!response.ok) {
+    const info = await response.json().catch(() => ({}));
+    throw new Error(typeof info.detail === 'string' ? info.detail : '联网找论文请求失败。');
+  }
+  return response;
+}
+
+export async function searchOnlinePapers(query: string): Promise<OnlinePaper[]> {
+  const response = await onlinePaperRequest(`?q=${encodeURIComponent(query)}`);
+  const result: { papers: OnlinePaper[] } = await response.json();
+  return result.papers;
+}
+
+export async function downloadOnlinePaper(paper: OnlinePaper): Promise<File> {
+  const response = await onlinePaperRequest(`/${encodeURIComponent(paper.id)}/pdf`);
+  const filename = paper.title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 120) + '.pdf';
+  return new File([await response.blob()], filename, { type: 'application/pdf' });
+}
+
 export const chatStream = async (
   question: string,
   top_k: number = 3,
@@ -220,8 +256,10 @@ export const chatStream = async (
   onComplete: (sources: Source[], tokenUsage: number) => void,
   attachmentText?: string,
   attachmentFilename?: string,
+  attachmentBasis?: 'pdf' | 'abstract',
 ): Promise<void> => {
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
+  if (attachmentBasis) body.attachment_basis = attachmentBasis;
   if (attachmentText) body.attachment_text = attachmentText;
   if (attachmentFilename) body.attachment_filename = attachmentFilename;
 
