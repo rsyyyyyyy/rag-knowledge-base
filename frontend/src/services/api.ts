@@ -1,6 +1,11 @@
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string) || 'http://localhost:8001/api';
+const API_BASE_URL = import.meta.env.DEV
+  ? '/api'
+  : (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001/api');
 
-export const getDocumentFileUrl = (documentId: string): string => `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/file`;
+export function getDocumentFileUrl(documentId: string, versionId?: string): string {
+  const url = `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/file`;
+  return versionId ? `${url}?version_id=${encodeURIComponent(versionId)}` : url;
+}
 
 export interface DirectoryItem {
   level: number;
@@ -35,6 +40,9 @@ export interface Document {
     filename: string;
     size: number;
     status?: string;
+    job_id?: string;
+    searchable?: boolean;
+    error_message?: string | null;
     uploaded_at: string;
     [key: string]: unknown;
   };
@@ -43,14 +51,23 @@ export interface Document {
 // 检索结果类型
 export interface RetrievedDocument extends Document {
   content: string;
-  distance?: number;
+  distance?: number | null;
+  similarity?: number | null;
+  rank_signals?: { lexical?: number; vector?: number };
+  fusion_score?: number | null;
 }
 
 // 来源类型
 export interface Source {
+  evidence_id?: string;
+  document_version_id?: string;
+  version_id?: string;
+  page_index?: number;
+  rects?: [number, number, number, number][];
   id: string;
   filename: string;
-  relevance: number;
+  chunk_id?: string;
+  excerpt: string;
 }
 
 // 问答响应类型
@@ -62,7 +79,7 @@ export interface ChatResponse {
 }
 
 // 上传文档
-export const uploadDocument = async (file: File, folderId?: string, onProgress?: (progress: number) => void): Promise<{ message: string; document_id: string; document?: Document }> => {
+export const uploadDocument = async (file: File, folderId?: string, onProgress?: (progress: number) => void): Promise<{ message: string; document_id: string; document?: Document; duplicate?: boolean }> => {
   const formData = new FormData();
   formData.append('file', file);
   if (folderId !== undefined) {
@@ -107,6 +124,19 @@ export const uploadDocument = async (file: File, folderId?: string, onProgress?:
     xhr.send(formData);
   });
 };
+
+export async function replaceDocument(documentId: string, file: File): Promise<{ document: Document }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await fetch(API_BASE_URL + '/documents/' + encodeURIComponent(documentId) + '/versions', {
+    method: 'POST', body: formData,
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || '替换文件失败');
+  }
+  return response.json();
+}
 
 // 获取文档列表
 export const getDocuments = async (): Promise<Document[]> => {
@@ -267,13 +297,15 @@ export const createFolder = async (name: string, parent_id: string | null = null
     params.append('parent_id', parent_id);
   }
 
-  const response = await fetch(`${API_BASE_URL}/folders?${params.toString()}`, {
+  const response = await fetch(API_BASE_URL + '/folders?' + params.toString(), {
     method: 'POST',
+  }).catch(() => {
+    throw new Error('无法连接知识库服务，请稍后重试。');
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error?.detail || 'Failed to create folder');
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.detail || '无法连接知识库服务，请稍后重试。');
   }
 
   return response.json();

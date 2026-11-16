@@ -2,7 +2,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, message } from 'antd';
-import { chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import type { Source } from './services/api';
+import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
+import { chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remend, { isWithinCodeBlock } from 'remend';
@@ -16,12 +19,6 @@ function formatStreamingMarkdown(content: string) {
     : markdown.replace(/(^|\s)\*\*$/, '$1');
 }
 
-
-interface Source {
-  id: string;
-  filename: string;
-  relevance: number;
-}
 
 interface Message {
   id?: number;
@@ -37,6 +34,9 @@ interface Document {
     filename: string;
     size: number;
     status?: string;
+    job_id?: string;
+    searchable?: boolean;
+    error_message?: string | null;
     uploaded_at: string;
     [key: string]: unknown;
   };
@@ -77,6 +77,7 @@ function App() {
 
 
   const [activeTab, setActiveTab] = useState('ask');
+  const [referenceFile, setReferenceFile] = useState<ReferenceFile | null>(null);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const [showCommandHint, setShowCommandHint] = useState(false);
@@ -108,6 +109,8 @@ function App() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [isFolderModalOpen, setIsFolderModalOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
+  const [isCreatingUploadFolder, setIsCreatingUploadFolder] = useState(false);
+  const creatingUploadFolderRef = useRef(false);
   const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
   const [renameFolderId, setRenameFolderId] = useState('');
   const [renameFolderName, setRenameFolderName] = useState('');
@@ -171,6 +174,39 @@ function App() {
     };
     loadDocuments();
   }, []);
+
+  const hasPendingIngestion = [documents, recentDocuments, favoriteDocuments]
+    .some(list => list.some(doc => isIngestionPending(doc.metadata.status)));
+
+  useEffect(() => {
+    if (!hasPendingIngestion) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const updates = new Map((await getDocuments()).map(doc => [doc.id, doc.metadata]));
+        if (cancelled) return;
+        const updateStatuses = (list: Document[]) => list.map(doc => {
+          if (!isIngestionPending(doc.metadata.status)) return doc;
+          const update = updates.get(doc.id);
+          if (!update || update.job_id !== doc.metadata.job_id) return doc;
+          return { ...doc, metadata: { ...doc.metadata, ...update } };
+        });
+        setDocuments(updateStatuses);
+        setRecentDocuments(updateStatuses);
+        setFavoriteDocuments(updateStatuses);
+      } catch (error) {
+        console.error('Error checking ingestion status:', error);
+      } finally {
+        if (!cancelled) timer = setTimeout(poll, 1500);
+      }
+    };
+    timer = setTimeout(poll, 700);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [hasPendingIngestion]);
 
   // 加载文件夹列表
   useEffect(() => {
@@ -593,8 +629,11 @@ function App() {
           });
           const realSize = uploadRes.document?.metadata?.size ?? file.size;
 
-          // 显示上传成功消息
-          message.success(`文件 "${file.name}" 上传成功（${formatFileSize(realSize)}），已添加到知识库。`);
+          if (uploadRes.duplicate) {
+            message.info('此文件已在当前文件夹中。');
+          } else {
+            message.success('文件已上传（' + formatFileSize(realSize) + '），已加入入库队列。');
+          }
         } catch (error) {
           console.error(`Error uploading file ${file.name}:`, error);
           message.error(`文件 "${file.name}" 上传失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -645,13 +684,9 @@ function App() {
 
     try {
       setIsLoading(true);
-      // 调用上传文档API来替换文件
-      const uploadRes = await uploadDocument(file, editFileId);
-      const realSize = uploadRes.document?.metadata?.size ?? file.size;
-      // 显示上传成功消息
-      message.success(`文件 "${file.name}" 编辑成功（${formatFileSize(realSize)}）。`);
-      // 重新加载文档列表，保持当前的搜索和筛选状态
-      await handleSearch();
+      const { document } = await replaceDocument(editFileId, file);
+      applyIngestionUpdate(document);
+      message.success('新版本已加入入库队列。');
       setIsEditFileModalOpen(false);
     } catch (error) {
       console.error('Error editing file:', error);
@@ -659,6 +694,27 @@ function App() {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const applyIngestionUpdate = (updated: Document) => {
+    const update = (list: Document[]) => list.map(doc => doc.id === updated.id ? updated : doc);
+    setDocuments(update);
+    setRecentDocuments(update);
+    setFavoriteDocuments(update);
+  };
+
+  const retryIngestion = async (docId: string) => {
+    try {
+      const { document } = await reindexDocument(docId);
+      applyIngestionUpdate(document);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '重试入库失败');
+    }
+  };
+
+  const showReplaceDialog = (docId: string) => {
+    setEditFileId(docId);
+    setIsEditFileModalOpen(true);
   };
 
   // 执行文件权限设置
@@ -880,9 +936,9 @@ function App() {
   }, []);
 
   return (
-    <div className="bg-gray-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 min-h-screen flex flex-col transition-colors duration-300">
+    <div className={`flex flex-col bg-gray-50 text-slate-900 transition-colors duration-300 dark:bg-slate-950 dark:text-slate-100 ${activeTab === 'ask' ? 'h-dvh overflow-hidden' : 'min-h-screen'}`}>
       {/* 顶栏：技术感知与状态 */}
-      <header className="h-16 border-b border-gray-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white dark:bg-slate-900 z-50 shadow-sm sticky top-0">
+      <header className="h-16 shrink-0 border-b border-gray-200 dark:border-slate-800 flex items-center justify-between px-6 bg-white dark:bg-slate-900 z-50 shadow-sm sticky top-0">
         <div className="flex items-center space-x-4">
           <div className="p-2 bg-brand-600 rounded-lg shadow-md">
             <Icon icon="solar:library-bold-duotone" className="text-white text-xl" />
@@ -931,9 +987,9 @@ function App() {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         {/* 左侧：导航菜单 */}
-        <aside className="w-64 flex flex-col border-r border-gray-200 dark:border-slate-800 bg-white dark:bg-slate-900 md:min-w-[16rem] shadow-sm">
+        <aside className={`w-64 flex-col border-r border-gray-200 dark:border-slate-800 bg-white dark:bg-slate-900 md:min-w-[16rem] shadow-sm ${activeTab === 'ask' && referenceFile ? 'hidden lg:flex' : 'flex'}`}>
           <div className="p-4 flex-1 overflow-y-auto hide-scrollbar space-y-6">
             {/* 快捷操作 */}
             <div className="space-y-1">
@@ -1014,14 +1070,14 @@ function App() {
         </aside>
 
         {/* 中间：主内容区 (Main Stage) */}
-        <main className="flex-1 flex flex-col min-w-0 bg-white dark:bg-slate-950 relative">
+        <main className={`relative flex min-h-0 min-w-0 flex-1 flex-col bg-white dark:bg-slate-950 ${activeTab === 'ask' && referenceFile ? 'overflow-hidden md:flex-row' : ''}`}>
           {/* 场景1：智能问答 Area */}
           {activeTab === 'ask' && (
-            <div className="flex-1 flex flex-col h-full">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {/* 消息展示区 */}
               <div
                 ref={chatScrollRef}
-                className="flex-1 overflow-y-auto p-6 md:px-20 space-y-8 hide-scrollbar"
+                className={`min-h-0 flex-1 overflow-y-auto p-4 space-y-8 hide-scrollbar ${referenceFile ? "md:px-6" : "md:px-20"}`}
                 onScroll={event => {
                   const { scrollHeight, scrollTop, clientHeight } = event.currentTarget;
                   followChatRef.current = scrollHeight - scrollTop - clientHeight <= 48;
@@ -1057,7 +1113,7 @@ function App() {
                           <Icon icon="solar:magic-stick-3-bold" className="text-white" />
                         </div>
                       )}
-                      <div className={`space-y-4 flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
+                      <div className={`space-y-4 min-w-0 flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`text-slate-800 dark:text-slate-200 leading-relaxed text-sm ${message.role === 'user' ? 'bg-gray-100 dark:bg-slate-800 p-4 rounded-xl' : ''}`}>
                           {message.role === 'assistant' ? (
                             <div className="chat-markdown">
@@ -1073,17 +1129,8 @@ function App() {
                             message.content
                           )}
                         </div>
-                        {/* 溯源标签/来源 */}
-                        {message.role === 'assistant' && message.sources && message.sources.length > 0 && (
-                          <div className="flex flex-wrap gap-2 justify-start">
-                            {message.sources.map((source, sourceIndex) => (
-                              <div key={sourceIndex} className="flex items-center space-x-2 px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700 text-[10px] text-gray-500 hover:shadow-sm cursor-pointer transition-shadow">
-                                <Icon icon="solar:file-check-bold-duotone" className="text-brand-500" />
-                                <span>{source.filename}</span>
-                                <span className="bg-brand-100 text-brand-700 px-1 rounded">{Math.round(source.relevance * 100)}% Match</span>
-                              </div>
-                            ))}
-                          </div>
+                        {message.role === 'assistant' && !!message.sources?.length && (
+                          <ReferenceSources sources={message.sources} onSelect={setReferenceFile} />
                         )}
                       </div>
                       {message.role === 'user' && (
@@ -1111,7 +1158,7 @@ function App() {
               </div>
 
               {/* 输入区 */}
-              <div className="p-6 md:px-20 border-t border-gray-200 dark:border-slate-800 bg-white/50 dark:bg-slate-900/50">
+              <div className={`shrink-0 p-4 border-t border-gray-200 dark:border-slate-800 bg-white/50 dark:bg-slate-900/50 ${referenceFile ? "md:px-6" : "md:px-20"}`}>
                 <div className="max-w-4xl mx-auto relative">
                   {/* 快捷指令预览 */}
                   <div className={`absolute bottom-full left-0 mb-2 w-64 bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-gray-200 dark:border-slate-700 p-2 z-50 ${showCommandHint ? '' : 'hidden'}`} id="command-hint">
@@ -1228,7 +1275,8 @@ function App() {
                               try {
                                 const uploadRes = await uploadDocument(file);
                                 const realSize = uploadRes.document?.metadata?.size ?? file.size;
-                                message.success(`文件 "${file.name}" 已添加到知识库（${formatFileSize(realSize)}）`);
+                                if (uploadRes.duplicate) message.info('此文件已在知识库中。');
+                                else message.success('文件已上传（' + formatFileSize(realSize) + '），已加入入库队列。');
                                 const docs = await getDocuments();
                                 setDocuments(docs);
                               } catch (error) {
@@ -1279,6 +1327,9 @@ function App() {
                 </div>
               </div>
             </div>
+          )}
+          {activeTab === 'ask' && referenceFile && (
+            <ReferencePanel file={referenceFile} onClose={() => setReferenceFile(null)} />
           )}
 
           {/* 场景2：知识库 Area */}
@@ -1601,11 +1652,11 @@ function App() {
                                       <div className="text-xs text-gray-500 space-y-1">
                                         <div>{formatFileSize(doc.metadata.size)} • {(doc.metadata.file_type as string) || ''}</div>
                                         <div>{formatDate(doc.metadata.uploaded_at)}</div>
-                                        {doc.metadata.status === 'failed' && (doc.metadata.error_message as string) && (
-                                          <div className="text-red-500 text-xs">
-                                            失败原因: {doc.metadata.error_message as string}
-                                          </div>
-                                        )}
+                                        <IngestionStatus
+                                          metadata={doc.metadata}
+                                          onRetry={() => retryIngestion(doc.id)}
+                                          onReplace={() => showReplaceDialog(doc.id)}
+                                        />
                                       </div>
                                     </div>
                                   </div>
@@ -1652,11 +1703,11 @@ function App() {
                                     <div className="text-xs text-gray-500 space-y-1">
                                       <div>{formatFileSize(doc.metadata.size)} • {(doc.metadata.file_type as string) || ''}</div>
                                       <div>{formatDate(doc.metadata.uploaded_at)}</div>
-                                      {doc.metadata.status === 'failed' && (doc.metadata.error_message as string) && (
-                                        <div className="text-red-500 text-xs">
-                                          失败原因: {doc.metadata.error_message as string}
-                                        </div>
-                                      )}
+                                      <IngestionStatus
+                                        metadata={doc.metadata}
+                                        onRetry={() => retryIngestion(doc.id)}
+                                        onReplace={() => showReplaceDialog(doc.id)}
+                                      />
                                     </div>
                                   </div>
 
@@ -1907,6 +1958,7 @@ function App() {
         title="选择上传目标文件夹"
         open={isFolderSelectorOpen}
         onOk={handleFolderSelectConfirm}
+        okButtonProps={{ disabled: isCreatingUploadFolder }}
         onCancel={() => setIsFolderSelectorOpen(false)}
         okText="确认"
         cancelText="取消"
@@ -1925,24 +1977,28 @@ function App() {
                 className="flex-1"
               />
               <button
-                className="px-3 py-1 bg-brand-600 text-white rounded-lg text-sm font-bold transition-all hover:shadow-md hover:bg-brand-700"
+                className="px-3 py-1 bg-brand-600 text-white rounded-lg text-sm font-bold transition-all hover:shadow-md hover:bg-brand-700 disabled:opacity-50"
+                disabled={isCreatingUploadFolder}
                 onClick={async () => {
-                  if (!newFolderName.trim()) {
+                  if (creatingUploadFolderRef.current) return;
+                  const name = newFolderName.trim();
+                  if (!name) {
                     message.warning('请输入文件夹名称');
                     return;
                   }
+                  creatingUploadFolderRef.current = true;
+                  setIsCreatingUploadFolder(true);
                   try {
-                    const createResult = await createFolder(newFolderName, null);
-                    // 重新加载所有文件夹
-                    const folderList = await getFolders();
-                    setFolders(folderList);
-                    // 自动选择新创建的文件夹
-                    setSelectedFolder(createResult.folder.id);
+                    const { folder } = await createFolder(name);
+                    setFolders(current => current.some(item => item.id === folder.id) ? current : [...current, folder]);
+                    setSelectedFolder(folder.id);
                     setNewFolderName('');
                     message.success('文件夹创建成功');
                   } catch (error) {
-                    console.error('Error creating folder:', error);
-                    message.error(`创建文件夹失败：${error instanceof Error ? error.message : '未知错误'}`);
+                    message.error('创建文件夹失败，' + (error instanceof Error ? error.message : '请稍后重试。'));
+                  } finally {
+                    creatingUploadFolderRef.current = false;
+                    setIsCreatingUploadFolder(false);
                   }
                 }}
               >
@@ -2067,7 +2123,7 @@ function App() {
 
       {/* 编辑文件对话框 */}
       <Modal
-        title="编辑文件"
+        title="替换文件"
         open={isEditFileModalOpen}
         onOk={() => document.getElementById('edit-file-input')?.click()}
         onCancel={() => setIsEditFileModalOpen(false)}
@@ -2078,10 +2134,11 @@ function App() {
         <input
           type="file"
           id="edit-file-input"
-          accept=".pdf,.doc,.docx,.txt"
+          accept=".pdf,.doc,.docx,.txt,.md"
           className="hidden"
           onChange={(e) => {
-            const file = e.target.files?.[0];
+            const file = e.currentTarget.files?.[0];
+            e.currentTarget.value = '';
             if (file) {
               handleEditFileSubmit(file);
             }

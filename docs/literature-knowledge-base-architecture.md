@@ -88,6 +88,21 @@ flowchart LR
 - 沿用 `POST /api/chat` 和 NDJSON。请求携带模式、会话、用户选定范围和预览文献 ID。流增加模式与任务进度事件，继续传输正文、最终引用和完成状态。
 - 模型生成引用标记时只允许指向本轮证据表。后端在完成事件前验证编号和版本，并返回最终引用；前端用已验证的数据渲染点击目标。点击后加载原版本，跳到指定页并绘制坐标高亮。定位失败时展示保存的证据原文及原因。[RAGFlow 引用解析](https://github.com/infiniflow/ragflow/blob/v1.0.0/internal/service/agentic_reference.go) · [RAGFlow PDF 高亮组件](https://github.com/infiniflow/ragflow/blob/v1.0.0/web/src/components/document-preview/pdf-preview.tsx)
 
+### 当前实现
+
+- 本地开发时，浏览器向 Vite 同源路径 /api 发请求，由 Vite 转发至 FastAPI。开发后端默认监听 8001，可通过 VITE_DEV_API_TARGET 指定另一个后端地址。
+
+- PDF 片段携带 SHA-256 文件版本、从零开始的页序和旋转后的归一化矩形。右侧阅读区通过 `GET /api/documents/{doc_id}/file?version_id={sha256}` 读取指定原件并在 PDF.js 中跳页和高亮。原件缺失或内容与版本不符时返回 404，前端显示上次检索保存的摘录。
+- 首次启动将旧 JSON 目录导入 SQLite，并登记已有 Chroma 片段。新文件按 SHA-256 与文件类型共享原件，同文件夹内重复导入复用现有文献。替换版本通过 `POST /api/documents/{doc_id}/versions` 提交，文献 ID 与名称沿用原记录。
+- 上传、替换和重建索引返回 202。前端通过目录列表轮询状态，`GET /api/documents/{doc_id}/ingestion` 也可查询单篇状态。文档管理中可对失败任务重试，对可检索文献重建索引。服务重启后重新排队未完成任务。
+- 后台先按任务 ID 暂存向量，再在单个 SQLite 事务中写入规范化片段、更新 FTS5、替换活动代次，并标记任务完成。问答与检索接口基于同一活动代次过滤向量。替换失败时，旧代次和原件继续可用。已发布 PDF 原件保留到移除该文献，旧引用仍可打开相应版本。FTS5 已随入库更新，问答的混合召回由下一阶段接入。
+
+- 开启知识库时，DeepSeek 先依据用户问题生成结构化路由，选择目录、概览、正文证据或通用回答。路由只接收问题文本，文件夹和文献名称在本地目录解析，并与请求的文献范围取交集。目录查询直接返回真实文件夹、文献或状态；同名与未匹配时给出相应提示。
+- 概览按篇抽取代表性片段供 DeepSeek 综合。单轮最多覆盖八篇可检索文献，每篇最多三个片段，回答显示实际覆盖数量。正文路径按问题混合召回、筛证据并生成回答。显式关闭知识库时跳过路由和检索。
+- 问答默认并行执行 FTS5/BM25 与 BGE 向量召回，再以 RRF 合并。FTS5 使用相同的中文分词规则处理片段及查询，并保留英文缩写、编号和 DOI。升级时从 SQLite 已有片段重建全文索引，无需重新嵌入或上传。
+- `POST /api/knowledge/list`、`/search`、`/read` 提供列出文献、搜索和读取原文。三者可接收 `document_ids`、`folder_ids`，同时提供时取交集。两路召回只读活动代次。搜索返回候选，原文读取验证范围和代次后才分配本轮证据 ID，可同时读取前后相邻片段。
+- `POST /api/retrieve` 通过 `retrieval_mode` 选择 `hybrid` 或 `vector`。排序信号用于比较召回效果，证据仍由原文是否支持所问事实决定。聊天结束事件提供本轮实际路由，用量包含路由调用。从 `backend` 运行 `python -m unittest discover -s tests -p test_retrieval.py` 可在临时数据目录复现排名对照、范围过滤及跨版本引用检查。
+
 ## 7 迁移、开发顺序与验收
 
 1. **先验证 PDF 坐标纵贯链路**。实现带版本的少量 PDF 解析与右栏页内高亮，测试中文、英文、双栏、旋转或裁切的样本，确认同一坐标在不同缩放下指向正确位置。这一步覆盖 FR-01 和 FR-06 的关键风险。
