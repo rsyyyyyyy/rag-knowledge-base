@@ -1012,6 +1012,10 @@ def generate_document_summary(doc_id: str):
             content = file_path.read_text(encoding="utf-8", errors="ignore")
         elif ext == ".docx":
             content = read_docx_text(file_path)
+        elif ext == ".pdf":
+            content = read_pdf_text(file_path)
+            if not content.strip():
+                raise HTTPException(status_code=400, detail="无法从 PDF 提取文字。请使用带文字层的 PDF，或先对扫描件进行 OCR。")
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type for summary generation")
 

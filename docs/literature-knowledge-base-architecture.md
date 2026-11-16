@@ -86,7 +86,7 @@ flowchart LR
 - 导入 API 接收 PDF 并返回文献版本和任务 ID。状态 API 暴露解析进度、失败原因和重试入口。
 - 文献 API 查询书目和版本元数据，按版本读取原 PDF，支持浏览器分页预览所需的范围请求。
 - 沿用 `POST /api/chat` 和 NDJSON。请求携带模式、会话、用户选定范围和预览文献 ID。流增加模式与任务进度事件，继续传输正文、最终引用和完成状态。
-- 模型生成引用标记时只允许指向本轮证据表。后端在完成事件前验证编号和版本，并返回最终引用；前端用已验证的数据渲染点击目标。点击后加载原版本，跳到指定页并绘制坐标高亮。定位失败时展示保存的证据原文及原因。[RAGFlow 引用解析](https://github.com/infiniflow/ragflow/blob/v1.0.0/internal/service/agentic_reference.go) · [RAGFlow PDF 高亮组件](https://github.com/infiniflow/ragflow/blob/v1.0.0/web/src/components/document-preview/pdf-preview.tsx)
+- 模型生成引用标记时只允许指向本轮证据表。后端在完成事件前验证编号和版本，并返回最终引用；前端用已验证的数据渲染点击目标。点击后加载原版本的完整 PDF，滚动到首个引用页，并提供命中页快捷跳转。PDF.js 只绘制可视区域附近的页面，缩放及栏宽变化时按同一归一化坐标重绘高亮。定位失败时展示保存的证据原文及原因。[RAGFlow 引用解析](https://github.com/infiniflow/ragflow/blob/v1.0.0/internal/service/agentic_reference.go) · [RAGFlow PDF 高亮组件](https://github.com/infiniflow/ragflow/blob/v1.0.0/web/src/components/document-preview/pdf-preview.tsx)
 
 ### 当前实现
 

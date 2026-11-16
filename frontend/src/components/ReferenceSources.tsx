@@ -1,5 +1,5 @@
 import { Icon } from '@iconify/react';
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { getDocumentFileUrl, getDocumentView, type Source } from '../services/api';
 
 const PdfReferencePreview = lazy(() => import('./PdfReferencePreview'));
@@ -140,10 +140,37 @@ function DocumentPreview({ file }: { file: ReferenceFile }) {
 }
 
 export function ReferencePanel({ file, onClose }: { file: ReferenceFile; onClose: () => void }) {
+  const [width, setWidth] = useState(42);
+  const drag = useRef<{ x: number; width: number; parentWidth: number } | null>(null);
+  const clamp = (value: number) => Math.max(30, Math.min(68, value));
   return (
+    <>
+    <div role="separator" tabIndex={0} aria-orientation="vertical" aria-label="调整原文预览宽度"
+      aria-valuemin={30} aria-valuemax={68} aria-valuenow={Math.round(width)}
+      className="order-last hidden w-2 shrink-0 cursor-col-resize touch-none select-none bg-gray-200 hover:bg-brand-500 focus-visible:bg-brand-500 dark:bg-slate-800 md:block"
+      onPointerDown={event => {
+        if (event.button !== 0 || !event.isPrimary) return;
+        const handle = event.currentTarget;
+        drag.current = { x: event.clientX, width, parentWidth: handle.parentElement!.clientWidth };
+        handle.setPointerCapture(event.pointerId);
+        event.preventDefault();
+      }}
+      onPointerMove={event => {
+        const start = drag.current;
+        if (!start || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+        setWidth(clamp(start.width + (start.x - event.clientX) / start.parentWidth * 100));
+      }}
+      onLostPointerCapture={() => { drag.current = null; }}
+      onKeyDown={event => {
+        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+        event.preventDefault();
+        setWidth(value => clamp(value + (event.key === 'ArrowLeft' ? 4 : -4)));
+      }}
+    />
     <aside
       aria-label="原文预览"
-      className="order-first flex h-[34dvh] min-h-0 min-w-0 shrink-0 flex-col overflow-hidden border-b border-gray-200 bg-gray-50 dark:border-slate-800 dark:bg-slate-900 md:order-last md:h-auto md:w-[clamp(16rem,33vw,40rem)] md:border-b-0 md:border-l"
+      style={{ '--reference-width': width + '%' } as CSSProperties}
+      className="order-first flex h-[34dvh] min-h-0 min-w-0 shrink-0 flex-col overflow-hidden border-b border-gray-200 bg-gray-50 dark:border-slate-800 dark:bg-slate-900 md:order-last md:h-auto md:w-[var(--reference-width)] md:border-b-0 md:border-l"
     >
       <header className="flex shrink-0 items-center justify-between gap-3 border-b border-gray-200 px-4 py-3 dark:border-slate-800">
         <div className="min-w-0">
@@ -163,6 +190,7 @@ export function ReferencePanel({ file, onClose }: { file: ReferenceFile; onClose
         <DocumentPreview key={JSON.stringify([file.id, file.versionId, file.sources.map(source => source.chunk_id)])} file={file} />
       </div>
     </aside>
+    </>
   );
 }
 

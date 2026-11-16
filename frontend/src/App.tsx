@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, message } from 'antd';
@@ -9,6 +9,14 @@ import IngestionStatus, { isIngestionPending } from './components/IngestionStatu
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remend, { isWithinCodeBlock } from 'remend';
+import type { PdfNavigation, PdfPageJump } from './components/PdfReferencePreview';
+
+const PdfReferencePreview = React.lazy(() => import('./components/PdfReferencePreview'));
+const noPdfSources: Source[] = [];
+
+function clampSummaryWidth(width: number) {
+  return Math.max(16, Math.min(40, width));
+}
 
 
 function formatStreamingMarkdown(content: string) {
@@ -103,6 +111,16 @@ function App() {
   const [documentView, setDocumentView] = useState<any | null>(null);
   const [documentViewLoading, setDocumentViewLoading] = useState(false);
   const [documentViewError, setDocumentViewError] = useState('');
+  const [summaryWidth, setSummaryWidth] = useState(20);
+  const summaryDrag = useRef<{ x: number; width: number; containerWidth: number } | null>(null);
+  const [pdfNavigation, setPdfNavigation] = useState<PdfNavigation | null>(null);
+  const [pdfPageJump, setPdfPageJump] = useState<PdfPageJump | null>(null);
+  const handlePdfPreviewError = useCallback(() => setDocumentViewError('无法加载 PDF 原件。'), []);
+  const pdfDirectory = pdfNavigation?.bookmarks.length
+    ? pdfNavigation.bookmarks
+    : Array.from({ length: pdfNavigation?.totalPages ?? 0 }, (_, pageIndex) => ({
+        title: `第 ${pageIndex + 1} 页`, level: 0, pageIndex,
+      }));
   // 智能总结状态
   const [summary, setSummary] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState<boolean>(false);
@@ -791,6 +809,8 @@ function App() {
   };
 
   const openDocumentInViewer = async (doc: Document) => {
+    setPdfNavigation(null);
+    setPdfPageJump(null);
     setSelectedDocument(doc);
     setIsDrawerOpen(true);
     setDocumentViewLoading(true);
@@ -825,8 +845,6 @@ function App() {
       setDocumentViewLoading(false);
     }
   };
-
-  // PDF 渲染已改为 iframe 内嵌浏览器原生 PDF 查看器，无需 useEffect
 
   // 渲染DOCX文件
   useEffect(() => {
@@ -1795,7 +1813,22 @@ function App() {
                 <h5 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">文档目录</h5>
               </div>
               <div className="p-2">
-                {documentView?.directory && documentView.directory.length > 0 ? (
+                {documentView?.view_type === 'pdf' ? (
+                  pdfNavigation ? (
+                    <nav className="space-y-1" aria-label={pdfNavigation.bookmarks.length ? 'PDF 章节目录' : 'PDF 页码导航'}>
+                      {!pdfNavigation.bookmarks.length && <p className="px-3 py-2 text-xs text-gray-500">PDF 没有可用书签，按页码浏览。</p>}
+                      {pdfDirectory.map((item, index) => (
+                        <button key={index} type="button"
+                          className="block w-full break-words rounded-lg px-3 py-2 text-left text-sm hover:bg-gray-200 dark:hover:bg-slate-800"
+                          style={{ paddingLeft: Math.min(item.level, 5) * 12 + 12 }}
+                          title={`跳到第 ${item.pageIndex + 1} 页`}
+                          onClick={() => setPdfPageJump(pdfNavigation.bookmarks.length ? { ...item } : { pageIndex: item.pageIndex })}>
+                          {item.title}
+                        </button>
+                      ))}
+                    </nav>
+                  ) : <p className="px-3 py-4 text-xs text-gray-500">{documentViewError ? '目录暂时无法加载' : '正在读取 PDF 目录…'}</p>
+                ) : documentView?.directory && documentView.directory.length > 0 ? (
                   <div className="space-y-1">
                     {documentView.directory.map((item: any, index: number) => (
                       <div
@@ -1824,7 +1857,7 @@ function App() {
             </div>
 
             {/* 中间文档内容 */}
-            <div className="flex-1 overflow-auto">
+            <div className="min-w-0 flex-1 overflow-auto">
               {documentViewLoading ? (
                 <div className="h-full flex items-center justify-center">
                   <div className="text-center">
@@ -1845,11 +1878,13 @@ function App() {
                   {/* 内容区域 */}
                   <div className="flex-1 overflow-auto">
                     {documentView?.view_type === 'pdf' && selectedDocument && (
-                      <iframe
-                        src={getDocumentFileUrl(selectedDocument.id)}
-                        className="w-full h-full border-0"
-                        title={selectedDocument.metadata.filename}
-                      />
+                      <div className="h-full p-3">
+                        <React.Suspense fallback={<p role="status">正在加载 PDF 阅读器…</p>}>
+                          <PdfReferencePreview key={selectedDocument.id} url={getDocumentFileUrl(selectedDocument.id)}
+                            sources={noPdfSources} onError={handlePdfPreviewError}
+                            onNavigation={setPdfNavigation} pageJump={pdfPageJump} />
+                        </React.Suspense>
+                      </div>
                     )}
                     {documentView?.view_type === 'docx' && documentView?.content && (
                       <div className="h-full overflow-auto p-6">
@@ -1921,9 +1956,35 @@ function App() {
             </div>
 
             {/* 右侧智能总结 */}
-            <div className="w-80 border-l border-gray-200 dark:border-slate-800 bg-gray-50 dark:bg-slate-900 overflow-y-auto">
+            <div role="separator" aria-label="调整智能总结栏宽度" aria-orientation="vertical"
+              aria-valuemin={16} aria-valuemax={40} aria-valuenow={Math.round(summaryWidth)} tabIndex={0}
+              className="hidden w-2 shrink-0 cursor-col-resize touch-none select-none bg-gray-200 hover:bg-brand-500 focus-visible:bg-brand-500 dark:bg-slate-800 lg:block"
+              onPointerDown={event => {
+                if (event.button !== 0 || !event.isPrimary) return;
+                const handle = event.currentTarget;
+                const containerWidth = handle.parentElement?.clientWidth;
+                if (!containerWidth) return;
+                summaryDrag.current = { x: event.clientX, width: summaryWidth, containerWidth };
+                handle.setPointerCapture(event.pointerId);
+                event.preventDefault();
+              }}
+              onPointerMove={event => {
+                const start = summaryDrag.current;
+                if (!start || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+                setSummaryWidth(clampSummaryWidth(start.width + (start.x - event.clientX) / start.containerWidth * 100));
+              }}
+              onLostPointerCapture={() => { summaryDrag.current = null; }}
+              onKeyDown={event => {
+                if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+                event.preventDefault();
+                setSummaryWidth(width => clampSummaryWidth(width + (event.key === 'ArrowLeft' ? 2 : -2)));
+              }}
+            />
+            <div style={{ '--summary-width': summaryWidth + '%' } as React.CSSProperties}
+              className="w-64 overflow-y-auto border-l border-gray-200 bg-gray-50 dark:border-slate-800 dark:bg-slate-900 lg:w-[var(--summary-width)] lg:shrink-0">
               <div className="p-4 border-b border-gray-200 dark:border-slate-800">
                 <h5 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">智能总结</h5>
+                {pdfNavigation && <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">PDF 原文 · 共 {pdfNavigation.totalPages} 页</p>}
               </div>
               <div className="p-4">
                 {summaryLoading ? (
