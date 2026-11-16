@@ -94,3 +94,10 @@ credentials.json
 
 # Local knowledge base files
 /backend/data/
+
+# 忽略虚拟环境
+.venv/
+
+# 忽略 Python 编译缓存
+__pycache__/
+*.pyc
