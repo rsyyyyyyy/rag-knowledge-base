@@ -28,7 +28,7 @@ class FullDocumentReadingTest(TestCase):
         client = Mock()
         def reduce(**kwargs):
             batch = kwargs['messages'][-1]['content']
-            numbers = list(dict.fromkeys(re.findall(r'【(\d+) ', batch)))
+            numbers = list(dict.fromkeys(re.findall(r'【批内来源 (\d+) ', batch)))
             note = json.dumps({'notes': [{'text': 'fact', 'sources': [int(n)]} for n in numbers]})
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=note),
                                                             finish_reason='stop')],
@@ -52,10 +52,33 @@ class FullDocumentReadingTest(TestCase):
         self.assertTrue(all(len(batch.encode('utf-8')) <= 4096 for batch in batches))
         self.assertIn('TAIL', batches[-1])
 
-    def test_invalid_reduction_citation_fails_instead_of_faking_coverage(self):
+    def test_invalid_reduction_citation_uses_original_excerpt(self):
         client = Mock()
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({'notes':[{'text':'wrong', 'sources':[999]}]})),
                                      finish_reason='stop')], usage=None)
-        with self.assertRaisesRegex(ValueError, '有效原文引用'):
-            prepare_full_context([source(1, 'X' * 9000)], 'overview', client, 'test', budget=4096)
+        text, _, report = prepare_full_context(
+            [source(73, 'X' * 9000)], 'overview', client, 'test', budget=4096,
+        )
+        self.assertIn('【原文节选】《paper.pdf》\nXXXX', text)
+        self.assertIn('[73](#evidence-73)', text)
+        self.assertNotIn('wrong', text)
+        self.assertNotIn('#evidence-999', text)
+        self.assertTrue(report['partial'])
+        self.assertLessEqual(len(text.encode('utf-8')), 4096)
+
+    def test_partial_reduction_keeps_valid_note_and_remaps_string_ids(self):
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({'notes': [
+                {'text': 'supported fact', 'sources': ['1']},
+                {'text': 'unsupported fact', 'sources': [999]},
+            ]})), finish_reason='stop')], usage=None,
+        )
+        text, _, report = prepare_full_context(
+            [source(42, 'A' * 5000)], 'overview', client, 'test', budget=4096,
+        )
+        self.assertIn('supported fact [42](#evidence-42)', text)
+        self.assertNotIn('unsupported fact', text)
+        self.assertNotIn('#evidence-1)', text)
+        self.assertTrue(report['partial'])

@@ -6,6 +6,8 @@ import chromadb
 import hashlib
 import os
 import json
+import asyncio
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from functools import lru_cache
@@ -38,6 +40,7 @@ from knowledge_search import (
 from pdf_evidence import pdf_version
 from question_router import plan_question
 from document_reading import prepare_full_context
+from evidence_grounding import quote_span, ground_answer
 from online_papers import public_link, router as online_papers_router
 
 DEEPSEEK_MODEL = "deepseek-flash"
@@ -673,7 +676,7 @@ def extract_directory(text: str, ext: str) -> list[dict]:
 
 # 获取文档可浏览内容（用于前端页面内查看）
 @app.get("/api/documents/{doc_id}/view")
-async def get_document_view(doc_id: str):
+def get_document_view(doc_id: str, include_pdf_text: bool = True):
     docs = load_documents_meta()
     target = next((d for d in docs if d.get("id") == doc_id), None)
     if not target:
@@ -699,17 +702,17 @@ async def get_document_view(doc_id: str):
         }
 
     if ext == ".pdf":
-        pdf_text = read_pdf_text(file_path)
-        directory = extract_directory(pdf_text, ".txt")  # PDF也用txt的目录提取逻辑
-        return {
+        result = {
             "id": doc_id,
             "filename": filename,
             "file_type": ext,
             "view_type": "pdf",
             "url": f"/api/documents/{doc_id}/file",
-            "content": pdf_text,  # 添加文本内容
-            "directory": directory
         }
+        if include_pdf_text:
+            pdf_text = read_pdf_text(file_path)
+            result.update(content=pdf_text, directory=extract_directory(pdf_text, ".txt"))
+        return result
     elif ext == ".docx":
         # 尝试从DOCX中提取文本并生成目录
         docx_text = read_docx_text_improved(file_path)
@@ -769,7 +772,10 @@ def read_knowledge(request: PassageRequest):
     return {"evidence": excerpts}
 
 
+AGREEMENT_QUERY = "Krippendorff inter-rater reliability inter-coder reliability K-Alpha"
 DETAIL_QUERIES = (
+    (r"组内(?:的)?一致性|(?:评分者|评审者|标注者)(?:之间|间)?(?:的)?一致性|inter[- ](?:rater|coder)[- ](?:agreement|reliability)|Krippendorff|K-Alpha",
+     AGREEMENT_QUERY),
     (r"实验|评估|划分|训练集|测试集|protocol|experiment|evaluation|train.test",
      "evaluation protocol experimental setup cross subject cross setup training testing split benchmark accuracy"),
     (r"设备|采集|传感器|拍摄|camera|sensor|collection",
@@ -786,47 +792,20 @@ def detail_queries(question):
 
 
 def verified_evidence(candidate, quote):
-    # Whitespace can differ when the model copies a quotation across PDF line breaks.
-    words = list(re.finditer(r"\S+", candidate["excerpt"]))
-    normalized = " ".join(word.group() for word in words)
-    quote = " ".join(quote.split())
-    if not quote or not words:
-        return None
-    offset = normalized.find(quote)
-    if offset < 0 or normalized.find(quote, offset + 1) >= 0:
-        return None
-
-    cursor = 0
-    start = end = None
-    for word in words:
-        word_end = cursor + len(word.group())
-        if start is None and offset < word_end:
-            start = word.start() + offset - cursor
-        if offset + len(quote) <= word_end:
-            end = word.start() + offset + len(quote) - cursor
-            break
-        cursor = word_end + 1
-    if start is None or end is None or start < 0 or end <= start:
-        return None
-    text = candidate["excerpt"]
-    evidence = {**candidate, "excerpt": text[start:end]}
-    if candidate.get("rects"):
-        first_line = text.count("\n", 0, start)
-        last_line = text.count("\n", 0, end - 1)
-        if len(candidate["rects"]) == text.count("\n") + 1:
-            evidence["rects"] = candidate["rects"][first_line:last_line + 1]
-        else:
-            evidence["rects"] = []
-    return evidence
+    return quote_span(candidate, quote)
 
 
 def line_evidence(candidate, first, last):
     lines = candidate["excerpt"].split("\n")
     if type(first) is not int or type(last) is not int or not 1 <= first <= last <= len(lines) or last - first >= 5:
         return None
-    excerpt = "\n".join(lines[first - 1:last]).strip()
+    raw_excerpt = "\n".join(lines[first - 1:last])
+    excerpt = raw_excerpt.strip()
     if not excerpt:
         return None
+    start = candidate.get("excerpt_start", 0) + sum(len(line) + 1 for line in lines[:first - 1])
+    start += len(raw_excerpt) - len(raw_excerpt.lstrip())
+    candidate = {**candidate, "excerpt_start": start, "excerpt_end": start + len(excerpt)}
     rects = candidate.get("rects") or []
     if len(rects) != len(lines):
         return {**candidate, "excerpt": excerpt, "rects": [], "citation_precision": "page"}
@@ -843,17 +822,20 @@ def select_rag_evidence(request: QueryRequest, retrieval_queries=()) -> tuple[li
     candidate_count = min(request.top_k, RAG_MAX_EVIDENCE_CANDIDATES)
     planned = [query.strip()[:240] for query in retrieval_queries if query.strip()]
     detail = detail_queries(request.question)
-    queries = list(dict.fromkeys([*planned, *detail]))[:4]
+    priority = [AGREEMENT_QUERY] if AGREEMENT_QUERY in detail else []
+    queries = list(dict.fromkeys([*priority, *planned, *detail]))[:4]
     with ingestion.index_lock:
         primary = session.search_knowledge(request.question, candidate_count, request.retrieval_mode)
         ids = [hit["chunk_id"] for hit in primary]
+        priority_ids = []
         if queries:
             # Reserve slots for detail queries within the same already-resolved documents.
             lanes = [session.search_knowledge(query, 6, request.retrieval_mode) for query in queries]
+            priority_ids = [hit["chunk_id"] for hit in lanes[0][:3]] if priority else []
             detail_ids = [lane[index]["chunk_id"] for index in range(6) for lane in lanes if index < len(lane)]
             detail_ids = list(dict.fromkeys(detail_ids))
             primary_slots = max(1, candidate_count // 2)
-            ids = list(dict.fromkeys(ids[:primary_slots] + detail_ids[:candidate_count] + ids))
+            ids = list(dict.fromkeys(priority_ids + ids[:primary_slots] + detail_ids[:candidate_count] + ids))
             ids = ids[:min(16, candidate_count * 2)]
         candidates = session.read_passages(ids)
         if candidates:
@@ -926,7 +908,9 @@ def select_rag_evidence(request: QueryRequest, retrieval_queries=()) -> tuple[li
             if evidence is None and isinstance(quote, str):
                 evidence = verified_evidence(candidate, quote)
             if evidence:
-                sources[number] = evidence
+                # The selected lines locate the evidence. The answer still needs
+                # their paragraph to interpret metrics, qualifiers and scope.
+                sources[number] = {**evidence, "context_excerpt": candidate["excerpt"]}
             elif number not in sources:
                 sources[number] = fragment(number)
 
@@ -947,7 +931,13 @@ def select_rag_evidence(request: QueryRequest, retrieval_queries=()) -> tuple[li
             for number in numbers[:6]:
                 if valid_number(number):
                     sources[number] = fragment(number)
-    return list(sources.values()), token_usage
+    # Keep a small set from the terminology-specific lane available to the
+    # answer and final verifier even if the first extraction skipped it.
+    by_id = {source['chunk_id']: source for source in sources.values()}
+    for candidate in candidates:
+        if candidate['chunk_id'] in priority_ids:
+            by_id.setdefault(candidate['chunk_id'], candidate)
+    return list(by_id.values()), token_usage
 
 
 def local_chat_reply(answer, stream, route, token_usage):
@@ -1005,11 +995,52 @@ def delete_chat_thread(thread_id: str):
 
 # 智能问答（RAG）
 @app.post("/api/chat")
-def chat(
+async def chat(
     request: QueryRequest,
     rag_enabled: bool = Query(default=True, description="Whether to use RAG"),
     stream: bool = Query(default=False, description="Whether to stream the response"),
 ):
+    if not stream:
+        return await asyncio.to_thread(chat_response, request, rag_enabled, False)
+
+    async def generate():
+        events = asyncio.Queue(maxsize=1)
+
+        async def prepare_and_stream():
+            try:
+                response = await asyncio.to_thread(chat_response, request, rag_enabled, True)
+                async for event in response.body_iterator:
+                    await events.put(event)
+            except HTTPException as error:
+                await events.put(json.dumps({"type": "error", "message": error.detail}) + "\n")
+            except Exception:
+                await events.put(json.dumps({"type": "error", "message": "知识库问答处理失败，请重试"}) + "\n")
+            await events.put(None)
+
+        worker = asyncio.create_task(prepare_and_stream())
+        try:
+            yield json.dumps({"type": "heartbeat"}) + "\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(events.get(), timeout=10)
+                except asyncio.TimeoutError:
+                    yield json.dumps({"type": "heartbeat"}) + "\n"
+                    continue
+                if event is None:
+                    break
+                yield event
+        finally:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+
+    return StreamingResponse(
+        generate(), media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
     try:
         route = "general"
         planning_tokens = 0
@@ -1018,6 +1049,7 @@ def chat(
         sources = []
         reading_report = None
         full_reading = False
+        grounding_report = None
         original_question = request.question
         thread_id = request.thread_id
         if thread_id:
@@ -1169,13 +1201,16 @@ def chat(
                         sources, resolved_question, reader, DEEPSEEK_MODEL,
                     )
                 retrieval_tokens += reading_tokens
+                if reading_report["partial"]:
+                    notice += "以下总结基于本轮能核验的原文，部分细节可能未覆盖。\n\n"
             except APIError as error:
                 raise deepseek_error(error) from error
             except ValueError as error:
                 raise HTTPException(status_code=502, detail=str(error)) from error
         else:
             context = "\n---\n".join(
-                f"【{source.get('citation_number', '')} {source['filename']}】\n{source['excerpt']}" for source in sources
+                f"【{source.get('citation_number', '')} {source['filename']}】\n"
+                f"{source.pop('context_excerpt', source['excerpt'])}" for source in sources
             )
 
         attachment_context = ""
@@ -1236,11 +1271,12 @@ def chat(
 
         if route in {"overview", "evidence"} and sources and context:
             system_prompt += (
-                "在每条由论文原文支持的关键结论后插入 Markdown 引用链接，例如 [1](#evidence-1)。"
+                "在每条由论文原文支持的关键结论后写证据标记 [ID:1]，其中数字必须是本轮给出的原文编号。"
                 "先核对每条结论分别由哪个编号支持。不同结论使用各自的编号；"
                 "多段共同支持一条结论时分别列出对应链接。不要把一个编号用于它不支持的结论，"
                 "也不要为了覆盖全部候选而引用没有用于回答的片段。不要照搬历史轮次的编号或状态提示。"
                 "每个结论只引用1至3个最直接支持的编号，禁止整批列出来源编号。"
+                "引用标记只放在正文，不追加引用目录、文件名清单或HTML锚点。"
             )
 
         if request.attachment_basis and has_attachment:
@@ -1298,8 +1334,34 @@ def chat(
             deepseek.close()
             raise deepseek_error(error) from error
 
+        def verify_final(answer):
+            if not rag_enabled or not any(s.get("citation_number") for s in sources):
+                return answer, sources, 0, None
+            session = knowledge_search.session(request)
+            expanded = {}
+            def expand(source):
+                chunk_id = source.get("chunk_id")
+                if chunk_id not in expanded:
+                    expanded[chunk_id] = session.read_passage(chunk_id, adjacent=1) if chunk_id else []
+                return expanded[chunk_id] or [source]
+            def repair(source, claim, search_query=None):
+                scoped = knowledge_search.session(KnowledgeScope(document_ids=[source['id']], folder_ids=request.folder_ids))
+                try:
+                    hits = scoped.search_knowledge((search_query or claim)[:4000], limit=4)
+                    reread = scoped.read_passages([hit['chunk_id'] for hit in hits])
+                    return [item for item in reread if item['document_version_id'] == source.get('document_version_id')]
+                except Exception as error:
+                    print(f"[grounding-retrieval] {type(error).__name__}")
+                    return []
+            try:
+                with get_deepseek_client() as verifier:
+                    return ground_answer(answer, sources, original_question, verifier, DEEPSEEK_MODEL, expand, repair)
+            except APIError as error:
+                raise deepseek_error(error) from error
+
         if stream:
             def generate():
+                nonlocal sources, grounding_report
                 token_usage = retrieval_tokens
                 answer_parts = []
                 try:
@@ -1323,6 +1385,16 @@ def chat(
                     yield json.dumps({"type": "error", "message": "DeepSeek 未返回有效回答，请重试"}) + "\n"
                     return
                 try:
+                    if rag_enabled and any(source.get("citation_number") for source in sources):
+                        yield json.dumps({"type": "verifying_citations"}) + "\n"
+                    answer, sources, audit_tokens, grounding_report = verify_final(answer)
+                    token_usage += audit_tokens
+                    yield json.dumps({"type": "answer", "content": notice + answer}) + "\n"
+                except Exception as error:
+                    print(f"[grounding] {type(error).__name__}")
+                    yield json.dumps({"type": "error", "message": "原文引用核验失败，本轮回答未保存，请重试。"}) + "\n"
+                    return
+                try:
                     save_turn(notice + answer)
                 except Exception as error:
                     print(f"[chat] 保存会话失败：{type(error).__name__}")
@@ -1330,7 +1402,7 @@ def chat(
                     return
                 if sources:
                     yield json.dumps({"type": "sources", "sources": sources}) + "\n"
-                yield json.dumps({"type": "end", "token_usage": token_usage, "route": route, "reading": reading_report}) + "\n"
+                yield json.dumps({"type": "end", "token_usage": token_usage, "route": route, "reading": reading_report, "grounding": grounding_report}) + "\n"
 
             return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -1338,9 +1410,12 @@ def chat(
         answer = response.choices[0].message.content if response.choices else None
         if not answer:
             raise HTTPException(status_code=502, detail="DeepSeek 未返回有效回答，请重试")
+        answer, sources, audit_tokens, grounding_report = verify_final(answer)
+        retrieval_tokens += audit_tokens
         save_turn(notice + answer)
         return {
             "answer": notice + answer,
+            "grounding": grounding_report,
             "sources": sources,
             "model_used": DEEPSEEK_MODEL,
             "reading": reading_report,

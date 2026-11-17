@@ -96,7 +96,7 @@ function ReferencePreview({ file }: { file: ReferenceFile }) {
     if (!loading && ranges.length) {
       firstHighlight.current?.scrollIntoView({ block: 'center' });
     }
-  }, [loading, ranges]);
+  }, [loading, ranges, file.selectionId]);
 
   if (loading) return <p role="status">正在加载原文…</p>;
 
@@ -145,7 +145,8 @@ function DocumentPreview({ file }: { file: ReferenceFile }) {
   if (file.versionId && !pdfFailed) {
     return (
       <Suspense fallback={<p role="status">正在加载 PDF 预览…</p>}>
-        <PdfReferencePreview url={getDocumentFileUrl(file.id, file.versionId)} sources={file.sources} onError={handlePdfError} />
+        <PdfReferencePreview url={getDocumentFileUrl(file.id, file.versionId)} sources={file.sources}
+          selectionId={file.selectionId} onError={handlePdfError} />
       </Suspense>
     );
   }
@@ -205,7 +206,7 @@ export function ReferencePanel({ file, onClose }: { file: ReferenceFile; onClose
         </button>
       </header>
       <div className="min-h-0 flex-1 overflow-auto p-4">
-        <DocumentPreview key={JSON.stringify([file.id, file.versionId, file.selectionId, file.sources.map(source => source.chunk_id)])} file={file} />
+        <DocumentPreview key={JSON.stringify([file.id, file.versionId])} file={file} />
       </div>
     </aside>
     </>

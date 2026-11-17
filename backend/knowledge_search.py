@@ -290,6 +290,11 @@ class KnowledgeReadSession:
                     "evidence_id": f"E{len(self.evidence) + 1}",
                     "filename": documents[row["doc_id"]].get("filename") or meta.get("filename"),
                     "excerpt": row["content"],
+                    "parser_version": meta.get("parser_version"),
+                    "section_heading": meta.get("section_heading"),
+                    "text_sha256": meta.get("text_sha256"),
+                    "elements": json.loads(meta.get("elements_json") or "[]"),
+                    "source_map": json.loads(meta.get("source_map_json") or "[]"),
                 }
                 if "rects_json" in meta and meta.get("version_id") == version_id:
                     excerpt.update(

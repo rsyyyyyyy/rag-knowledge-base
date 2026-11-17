@@ -24,8 +24,9 @@ export interface DocumentViewResponse {
   directory?: DirectoryItem[];
 }
 
-export const getDocumentView = async (documentId: string): Promise<DocumentViewResponse> => {
-  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/view`);
+export const getDocumentView = async (documentId: string, includePdfText = true): Promise<DocumentViewResponse> => {
+  const query = includePdfText ? '' : '?include_pdf_text=false';
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/view${query}`);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data?.detail || 'Failed to load document view');
@@ -61,7 +62,12 @@ export interface RetrievedDocument extends Document {
 export interface Source {
   evidence_id?: string;
   citation_number?: number;
-  citation_precision?: 'fragment' | 'page';
+  citation_precision?: 'fragment' | 'page' | 'line' | 'quote' | 'text';
+  span_id?: string;
+  element_refs?: string[];
+  claim?: string;
+  excerpt_start?: number;
+  excerpt_end?: number;
   document_version_id?: string;
   version_id?: string;
   page_index?: number;
@@ -284,12 +290,13 @@ export const chatStream = async (
   top_k: number = 3,
   rag_enabled: boolean = true,
   onChunk: (chunk: string) => void,
-  onComplete: (sources: Source[], tokenUsage: number) => void,
+  onComplete: (sources: Source[], tokenUsage: number, finalAnswer?: string) => void,
   attachmentText?: string,
   attachmentFilename?: string,
   attachmentBasis?: 'pdf' | 'abstract',
   threadId?: string,
   attachmentSourceUrl?: string,
+  onVerifyingCitations?: () => void,
 ): Promise<void> => {
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
   if (threadId) body.thread_id = threadId;
@@ -319,6 +326,7 @@ export const chatStream = async (
   const decoder = new TextDecoder();
   let buffer = '';
   let sources: Source[] = [];
+  let finalAnswer: string | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -336,13 +344,17 @@ export const chatStream = async (
       const data = JSON.parse(line);
       if (data.type === 'text' && data.content) {
         onChunk(data.content);
+      } else if (data.type === 'answer') {
+        finalAnswer = data.content;
+      } else if (data.type === 'verifying_citations') {
+        onVerifyingCitations?.();
       } else if (data.type === 'sources') {
         sources = data.sources;
       } else if (data.type === 'error') {
         throw new Error(data.message);
       } else if (data.type === 'end') {
-        await reader.cancel();
-        onComplete(sources, data.token_usage ?? 0);
+        onComplete(sources, data.token_usage ?? 0, finalAnswer);
+        await reader.cancel().catch(() => {});
         return;
       }
     }

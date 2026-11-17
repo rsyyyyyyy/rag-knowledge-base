@@ -122,13 +122,18 @@ class RetrievalIntegrationTest(TestCase):
             payload = {"question": question, **(scope or {})}
             plan = QuestionPlan(route=route, folder_names=list(folders), document_names=list(names), count_only=count,
                                 reference_mode=reference, reference_indices=list(indices))
-            with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(plan, 5)):
+            # Scope/routing assertions are independent of the semantic evidence verifier.
+            with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(plan, 5)), patch(
+                "app.ground_answer", side_effect=lambda answer, sources, *args: (answer, sources, 0, {})
+            ):
                 create = factory.return_value.chat.completions.create
                 create.return_value = completion
                 response = client.post("/api/chat" + ("?stream=true" if stream else ""), json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
                 if stream:
-                    return [json.loads(line) for line in response.iter_lines()], create
+                    events = [json.loads(line) for line in response.iter_lines()]
+                    self.assertEqual(events[0]["type"], "heartbeat")
+                    return [event for event in events if event["type"] != "heartbeat"], create
                 return response.json(), create
 
         listing, create = ask("我放在 Energy 那一栏的材料给我盘点一遍", "documents", folders=["Energy"])
@@ -188,6 +193,30 @@ class RetrievalIntegrationTest(TestCase):
         self.assertEqual(full["reading"]["chunks_total"], 2)
         self.assertEqual(full["reading"]["chunks_read"], 2)
         self.assertIn("37 hours", create.call_args.kwargs["messages"][-1]["content"])
+        # Real grounding pipeline: neighboring original passages, quote offsets,
+        # canonical numbering and narrowed PDF boxes survive the HTTP response.
+        from types import SimpleNamespace as NS
+        answer_text = "Battery duration was exactly 37 hours. [2](#evidence-2)"
+        def reply(content):
+            return NS(choices=[NS(message=NS(content=content), finish_reason="stop")], usage=NS(total_tokens=12))
+        with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(
+            QuestionPlan(route="overview"), 5,
+        )):
+            factory.return_value.__enter__.return_value = factory.return_value
+            factory.return_value.chat.completions.create.side_effect = [
+                reply(answer_text), reply(json.dumps({"checks":[{"ref":"0","supported":True,
+                    "claim":"Battery duration was exactly 37 hours.", "passage":2,
+                    "quote":"Battery duration was exactly 37 hours."}]})),
+            ]
+            grounded = checked(client.post('/api/chat', json={"question":"Explain duration", "document_ids":[aurora]}))
+        self.assertIn('[1](#evidence-1)', grounded['answer'])
+        self.assertEqual(len(grounded['sources']), 1)
+        self.assertEqual(grounded['sources'][0]['page_index'], 1)
+        self.assertEqual(grounded['sources'][0]['excerpt'], 'Battery duration was exactly 37 hours.')
+        self.assertTrue(grounded['sources'][0]['span_id'])
+        self.assertTrue(grounded['sources'][0]['element_refs'])
+        self.assertEqual(grounded['sources'][0]['citation_precision'], 'quote')
+        self.assertEqual(grounded['token_usage'], 29)
         class FakeStream:
             def __enter__(self):
                 return self
@@ -202,7 +231,7 @@ class RetrievalIntegrationTest(TestCase):
 
         with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(
             QuestionPlan(route="overview"), 5,
-        )):
+        )), patch("app.ground_answer", side_effect=lambda answer, sources, *args: (answer, sources, 0, {})):
             factory.return_value.chat.completions.create.return_value = FakeStream()
             response = client.post("/api/chat?stream=true", json={
                 "question": "完整介绍这篇", "document_ids": [aurora],

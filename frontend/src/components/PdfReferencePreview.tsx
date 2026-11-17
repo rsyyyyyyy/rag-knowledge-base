@@ -1,6 +1,6 @@
 import { getDocument, GlobalWorkerOptions, type PDFPageProxy, type PDFDocumentProxy } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Source } from '../services/api';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
@@ -86,13 +86,17 @@ interface PdfReferencePreviewProps {
   onError: () => void;
   onNavigation?: (navigation: PdfNavigation) => void;
   pageJump?: PdfPageJump | null;
+  selectionId?: number;
 }
 
 type PageRect = NonNullable<Source['rects']>[number];
 const emptyRects: PageRect[] = [];
 
-function PdfPage({ page, scroller, width, rects }: {
-  page: PDFPageProxy;
+function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects }: {
+  page?: PDFPageProxy;
+  pageNumber: number;
+  ratio: number;
+  requestPage: (pageNumber: number) => Promise<PDFPageProxy>;
   scroller: HTMLDivElement | null;
   width: number;
   rects: PageRect[];
@@ -101,7 +105,8 @@ function PdfPage({ page, scroller, width, rects }: {
   const surface = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [failed, setFailed] = useState(false);
-  const natural = page.getViewport({ scale: 1 });
+  const natural = page?.getViewport({ scale: 1 });
+  const naturalWidth = natural?.width;
 
   useEffect(() => {
     const element = frame.current;
@@ -115,13 +120,22 @@ function PdfPage({ page, scroller, width, rects }: {
   }, [scroller]);
 
   useEffect(() => {
+    if (!nearViewport || page) return;
+    let active = true;
+    void requestPage(pageNumber).catch(() => {
+      if (active) setFailed(true);
+    });
+    return () => { active = false; };
+  }, [nearViewport, page, pageNumber, requestPage]);
+
+  useEffect(() => {
     const host = surface.current;
     if (!host) return;
-    if (!nearViewport) {
+    if (!nearViewport || !page || !naturalWidth) {
       host.replaceChildren();
       return;
     }
-    const viewport = page.getViewport({ scale: width / natural.width });
+    const viewport = page.getViewport({ scale: width / naturalWidth });
     const ratio = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(8_000_000 / (viewport.width * viewport.height)));
     const canvas = document.createElement('canvas');
     canvas.width = Math.ceil(viewport.width * ratio);
@@ -147,12 +161,12 @@ function PdfPage({ page, scroller, width, rects }: {
       window.clearTimeout(timer);
       render?.cancel();
     };
-  }, [nearViewport, natural.width, page, width]);
+  }, [nearViewport, naturalWidth, page, width]);
 
   return (
-    <div ref={frame} data-pdf-page={page.pageNumber} aria-label={`PDF 第 ${page.pageNumber} 页`}
+    <div ref={frame} data-pdf-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}
       role="group" className="relative mx-auto bg-white shadow-sm"
-      style={{ width, aspectRatio: natural.width / natural.height }}>
+      style={{ width, aspectRatio: natural ? natural.width / natural.height : ratio }}>
       <div ref={surface} className="absolute inset-0" />
       {failed && <p role="status" className="p-3 text-slate-900">这一页暂时无法渲染。</p>}
       {rects.length > 0 && (
@@ -169,32 +183,51 @@ function PdfPage({ page, scroller, width, rects }: {
   );
 }
 
-export default function PdfReferencePreview({ url, sources, onError, onNavigation, pageJump }: PdfReferencePreviewProps) {
-  const [pages, setPages] = useState<PDFPageProxy[]>([]);
+export default function PdfReferencePreview({ url, sources, onError, onNavigation, pageJump, selectionId }: PdfReferencePreviewProps) {
+  const [preview, setPreview] = useState<{ pdf: PDFDocumentProxy; initialPage: PDFPageProxy } | null>(null);
+  const [pages, setPages] = useState(new Map<number, PDFPageProxy>());
+  const preferredPage = useRef(Math.min(...sources.map(source => (source.page_index ?? Infinity) + 1)));
+  const totalPages = preview?.pdf.numPages ?? 0;
+  const requestPage = useCallback(async (pageNumber: number) => {
+    if (!preview) throw new Error('PDF is not ready');
+    const page = await preview.pdf.getPage(pageNumber);
+    setPages(current => current.has(pageNumber) ? current : new Map(current).set(pageNumber, page));
+    return page;
+  }, [preview]);
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const [availableWidth, setAvailableWidth] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
   const [zoom, setZoom] = useState(1);
   const anchor = useRef<{ page: HTMLElement; x: number; y: number; clientX: number; clientY: number } | null>(null);
-  const initialJump = useRef(false);
   const highlights = new Map<number, PageRect[]>();
   for (const source of sources) {
     const index = source.page_index;
-    if (index === undefined || !Number.isInteger(index) || index < 0 || index >= pages.length) continue;
+    if (index === undefined || !Number.isInteger(index) || index < 0 || index >= totalPages) continue;
     const rects = highlights.get(index) ?? [];
     rects.push(...(source.rects ?? []));
     highlights.set(index, rects);
   }
   const evidence = sources.flatMap((source, index) => {
     const pageIndex = source.page_index;
+    const rects = source.rects ?? [];
+    const top = rects.length ? Math.min(...rects.map(rect => rect[1])) : 0;
+    const bottom = rects.length ? Math.max(...rects.map(rect => rect[3])) : 1;
+    const centerX = rects.length
+      ? (Math.min(...rects.map(rect => rect[0])) + Math.max(...rects.map(rect => rect[2]))) / 2
+      : 0.5;
     return pageIndex !== undefined && highlights.has(pageIndex) ? [{
-      index, pageIndex, top: source.rects?.[0]?.[1] ?? 0,
+      index, pageIndex, top, centerY: (top + bottom) / 2, centerX,
       number: source.citation_number,
       precision: !source.rects?.length ? '仅页码' : source.citation_precision === 'fragment' ? '片段高亮' : '原文高亮',
     }] : [];
   }).sort((a, b) => a.pageIndex - b.pageIndex || a.top - b.top);
   const firstEvidencePage = evidence[0]?.pageIndex;
-  const firstEvidenceTop = evidence[0]?.top ?? 0;
-  const canRead = pages.length > 0 && availableWidth > 0;
+  const firstEvidenceCenterY = evidence[0]?.centerY ?? 0.5;
+  const firstEvidenceCenterX = evidence[0]?.centerX ?? 0.5;
+  const canRead = preview !== null && availableWidth > 0;
+  const initialViewport = preview?.initialPage.getViewport({ scale: 1 });
+  const initialRatio = initialViewport ? initialViewport.width / initialViewport.height : 1;
+  const firstEvidencePageReady = firstEvidencePage !== undefined && pages.has(firstEvidencePage + 1);
 
   useEffect(() => {
     let active = true;
@@ -205,13 +238,18 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
       StandardFontDataFactory: StandardFontReader,
     });
     void task.promise.then(async pdf => {
-      if (onNavigation && active) {
+      if (!active) return;
+      const wanted = preferredPage.current;
+      const initialPage = await pdf.getPage(Number.isInteger(wanted) && wanted > 0 && wanted <= pdf.numPages ? wanted : 1);
+      if (!active) return;
+      setPages(new Map([[initialPage.pageNumber, initialPage]]));
+      setPreview({ pdf, initialPage });
+      if (onNavigation) {
+        onNavigation({ totalPages: pdf.numPages, bookmarks: [] });
         void readBookmarks(pdf).catch(() => []).then(bookmarks => {
           if (active) onNavigation({ totalPages: pdf.numPages, bookmarks });
         });
       }
-      const allPages = await Promise.all(Array.from({ length: pdf.numPages }, (_, i) => pdf.getPage(i + 1)));
-      if (active) setPages(allPages);
     }).catch(() => { if (active) onError(); });
     return () => {
       active = false;
@@ -221,7 +259,10 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
 
   useLayoutEffect(() => {
     if (!scroller) return;
-    const measure = () => setAvailableWidth(Math.max(0, scroller.clientWidth - 16));
+    const measure = () => {
+      setAvailableWidth(Math.max(0, scroller.clientWidth - 16));
+      setViewportHeight(scroller.clientHeight);
+    };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(scroller);
@@ -229,38 +270,39 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
   }, [scroller]);
 
   useLayoutEffect(() => {
-    if (!scroller || !canRead || initialJump.current) return;
-    initialJump.current = true;
-    if (firstEvidencePage === undefined) return;
-    jumpToEvidence(scroller, firstEvidencePage, firstEvidenceTop);
-  }, [scroller, canRead, firstEvidencePage, firstEvidenceTop]);
+    if (!scroller || !canRead || firstEvidencePage === undefined) return;
+    jumpToEvidence(scroller, firstEvidencePage, firstEvidenceCenterY, firstEvidenceCenterX);
+  }, [scroller, canRead, selectionId, viewportHeight, firstEvidencePage, firstEvidencePageReady, firstEvidenceCenterY, firstEvidenceCenterX]);
 
   useEffect(() => {
     if (!scroller || !canRead || !pageJump) return;
-    const page = pages[pageJump.pageIndex];
-    if (!page) return;
+    if (pageJump.pageIndex < 0 || pageJump.pageIndex >= totalPages) return;
     if (!pageJump.title) {
-      jumpToEvidence(scroller, pageJump.pageIndex, 0);
+      scrollToPdfPosition(scroller, pageJump.pageIndex, 0, 8);
       return;
     }
     let active = true;
-    const viewport = page.getViewport({ scale: 1 });
-    const { x, y } = pageJump.destination ?? {};
-    const hasDestinationY = page.rotate % 180 === 0 ? y !== undefined : x !== undefined;
-    const destinationY = hasDestinationY
-      ? viewport.convertToViewportPoint(x ?? page.view[0], y ?? page.view[3])[1] / viewport.height
-      : undefined;
-    void findHeading(page, pageJump.title, destinationY).catch(() => undefined).then(headingY => {
+    const title = pageJump.title;
+    // Bring the target into view while its page dimensions and heading load.
+    scrollToPdfPosition(scroller, pageJump.pageIndex, 0, 8);
+    void requestPage(pageJump.pageIndex + 1).then(async page => {
+      const viewport = page.getViewport({ scale: 1 });
+      const { x, y } = pageJump.destination ?? {};
+      const hasDestinationY = page.rotate % 180 === 0 ? y !== undefined : x !== undefined;
+      const destinationY = hasDestinationY
+        ? viewport.convertToViewportPoint(x ?? page.view[0], y ?? page.view[3])[1] / viewport.height
+        : undefined;
+      return await findHeading(page, title, destinationY).catch(() => undefined) ?? destinationY;
+    }).catch(() => undefined).then(top => {
       if (!active) return;
-      const top = headingY ?? destinationY;
       if (top === undefined) {
-        jumpToEvidence(scroller, pageJump.pageIndex, 0);
+        scrollToPdfPosition(scroller, pageJump.pageIndex, 0, 8);
       } else {
         scrollToPdfPosition(scroller, pageJump.pageIndex, Math.max(0, Math.min(1, top)), scroller.clientHeight / 2);
       }
     });
     return () => { active = false; };
-  }, [canRead, pageJump, pages, scroller]);
+  }, [canRead, pageJump, totalPages, requestPage, scroller]);
 
   useEffect(() => {
     if (!scroller) return;
@@ -296,7 +338,7 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 text-sm">
       <div className="shrink-0 space-y-2">
         <div className="flex flex-wrap items-center gap-2">
-          <span>{pages.length ? `全文 · ${pages.length} 页` : 'PDF 全文'}</span>
+          <span>{totalPages ? `全文 · ${totalPages} 页` : 'PDF 全文'}</span>
           <button type="button" aria-label="缩小 PDF" className="rounded border px-2"
             disabled={zoom <= 0.5} onClick={() => setZoom(value => Math.max(0.5, value / 1.1))}>−</button>
           <button type="button" className="rounded border px-2" title="恢复适合宽度"
@@ -309,8 +351,8 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
         {evidence.length > 0 && (
           <div className="flex max-h-24 flex-wrap items-center gap-2 overflow-auto" aria-label="引用片段">
             <span className="text-xs text-gray-500 dark:text-slate-400">跳转到命中片段：</span>
-            {evidence.map(({ index, pageIndex, top, number, precision }) => (
-              <button key={index} type="button" onClick={() => jumpToEvidence(scroller, pageIndex, top)}
+            {evidence.map(({ index, pageIndex, centerY, centerX, number, precision }) => (
+              <button key={index} type="button" onClick={() => jumpToEvidence(scroller, pageIndex, centerY, centerX)}
                 className="rounded border border-yellow-500 px-2 py-1 hover:bg-yellow-100 hover:text-slate-950">
                 {number === undefined ? `片段 ${index + 1}` : `[${number}]`} · 第 {pageIndex + 1} 页 · {precision}
               </button>
@@ -321,9 +363,14 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
       <div ref={setScroller} tabIndex={0} aria-label="PDF 全文页面"
         className="min-h-0 flex-1 overflow-auto overscroll-contain rounded bg-slate-200 dark:bg-slate-800">
         {!canRead && <p role="status" className="p-3">正在加载 PDF 全文…</p>}
-        {canRead && <div className="space-y-2 p-2" style={{ width: Math.max(availableWidth, availableWidth * zoom) + 16 }}>
-          {pages.map((page, index) => (
-            <PdfPage key={page.pageNumber} page={page} scroller={scroller}
+        {canRead && <div className="space-y-2 p-2" style={{
+          width: Math.max(availableWidth, availableWidth * zoom) + 16,
+          // Leave room to center evidence near the first and last page edges.
+          paddingBlock: evidence.length ? Math.max(8, viewportHeight / 2) : undefined,
+        }}>
+          {Array.from({ length: totalPages }, (_, index) => (
+            <PdfPage key={index + 1} page={pages.get(index + 1)} pageNumber={index + 1}
+              ratio={initialRatio} requestPage={requestPage} scroller={scroller}
               width={availableWidth * zoom} rects={highlights.get(index) ?? emptyRects} />
           ))}
         </div>}
@@ -365,13 +412,18 @@ async function findHeading(page: PDFPageProxy, title: string, destinationY?: num
   return matches[0] ? position(matches[0]) : undefined;
 }
 
-function jumpToEvidence(scroller: HTMLDivElement | null, pageIndex: number, top: number) {
-  scrollToPdfPosition(scroller, pageIndex, top, 8);
+function jumpToEvidence(scroller: HTMLDivElement | null, pageIndex: number, y: number, x: number) {
+  if (!scroller) return;
+  scrollToPdfPosition(scroller, pageIndex, y, scroller.clientHeight / 2, x);
 }
 
-function scrollToPdfPosition(scroller: HTMLDivElement | null, pageIndex: number, top: number, offset: number) {
-  const element = scroller?.querySelector(`[data-pdf-page="${pageIndex + 1}"]`);
-  if (!element || !scroller) return;
+function scrollToPdfPosition(scroller: HTMLDivElement, pageIndex: number, top: number, offset: number, x?: number) {
+  const element = scroller.querySelector(`[data-pdf-page="${pageIndex + 1}"]`);
+  if (!element) return;
   const rect = element.getBoundingClientRect();
-  scroller.scrollTop += rect.top + rect.height * top - scroller.getBoundingClientRect().top - offset;
+  const viewport = scroller.getBoundingClientRect();
+  scroller.scrollTop += rect.top + rect.height * top - viewport.top - offset;
+  if (x !== undefined) {
+    scroller.scrollLeft += rect.left + rect.width * x - viewport.left - scroller.clientWidth / 2;
+  }
 }

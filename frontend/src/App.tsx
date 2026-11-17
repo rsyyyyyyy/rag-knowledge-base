@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, Tooltip, message } from 'antd';
@@ -9,6 +9,7 @@ import { chatStream, listChatThreads, createChatThread, getChatThread, renameCha
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { citationNumberFromHref, remarkCitationLinks } from './citationLinks';
 import remend, { isWithinCodeBlock } from 'remend';
 import type { PdfNavigation, PdfPageJump } from './components/PdfReferencePreview';
 
@@ -35,6 +36,7 @@ interface Message {
   content: string;
   sources?: Source[];
   complete?: boolean; // 标记消息是否完成
+  verifyingCitations?: boolean;
 }
 
 function presentAnswer(content: string) {
@@ -43,7 +45,10 @@ function presentAnswer(content: string) {
     /^\*\*(全文阅读|文献概览|引用定位)\*\*/.test(line)
     || /^已读取 \d+\/\d+ 个正文片段。/.test(line)
     || line === '长文已分批阅读并汇总；汇总可能省略细节，可继续针对具体章节追问。'
-  )).join('\n').trimStart();
+  )).join('\n')
+    .replace(/该项结论的原文依据不足。([ \t]*[。.!?！？])+/g, '该项结论的原文依据不足。')
+    .replace(/该项结论的原文依据不足。(\s*该项结论的原文依据不足。)+/g, '该项结论的原文依据不足。')
+    .trimStart();
 }
 
 function chatMessages(turns: ChatTurn[]): Message[] {
@@ -186,6 +191,7 @@ function App() {
   const [filterType, setFilterType] = useState('all'); // 筛选类型：all, recent, favorite
   const [activeFilter, setActiveFilter] = useState('all'); // 当前激活的筛选
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const documentViewRequest = useRef(0);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const followChatRef = useRef(true);
   const chatInFlightRef = useRef(false);
@@ -835,6 +841,7 @@ function App() {
   };
 
   const openDocumentInViewer = async (doc: Document) => {
+    const request = ++documentViewRequest.current;
     setPdfNavigation(null);
     setPdfPageJump(null);
     setSelectedDocument(doc);
@@ -844,17 +851,8 @@ function App() {
     // 清空之前的总结状态
     setSummary(null);
     setSummaryError(null);
-    try {
-      // 更新文档访问时间
-      await updateDocumentAccess(doc.id);
-
-      const view = await getDocumentView(doc.id);
-      setDocumentView(view);
-      // 保持在知识库页面，在右侧显示文档预览
-      setIsDrawerOpen(true);
-
-      // 重新加载文档列表，更新最近使用状态
-      const docs = await getDocuments();
+    void updateDocumentAccess(doc.id).then(getDocuments).then(docs => {
+      if (request !== documentViewRequest.current) return;
       setDocuments(docs);
 
       // 更新最近使用的文档
@@ -864,11 +862,16 @@ function App() {
         return dateB - dateA;
       }).slice(0, 5);
       setRecentDocuments(recentDocs);
+    }).catch(() => {});
+    try {
+      const view = await getDocumentView(doc.id, false);
+      if (request === documentViewRequest.current) setDocumentView(view);
     } catch (error) {
+      if (request !== documentViewRequest.current) return;
       setDocumentView(null);
       setDocumentViewError(error instanceof Error ? error.message : '加载文档失败');
     } finally {
-      setDocumentViewLoading(false);
+      if (request === documentViewRequest.current) setDocumentViewLoading(false);
     }
   };
 
@@ -900,9 +903,6 @@ function App() {
     setInputValue(value);
     setShowCommandHint(value.startsWith('/'));
 
-    // 自动调整高度
-    e.target.style.height = 'auto';
-    e.target.style.height = `${e.target.scrollHeight}px`;
   };
 
   useEffect(() => {
@@ -1059,12 +1059,15 @@ function App() {
             reply.id === replyId ? { ...reply, content: reply.content + chunk } : reply
           ));
         },
-        sources => {
+        (sources, _tokenUsage, finalAnswer) => {
           const linkedSources = sources.map(source => source.id === 'attachment' && attachment?.basis
             ? { ...source, attachmentBasis: attachment.basis, sourceUrl: attachment.sourceUrl }
             : source);
           setMessages(previous => previous.map(reply =>
-            reply.id === replyId ? { ...reply, complete: true, sources: linkedSources } : reply
+            reply.id === replyId ? {
+              ...reply, content: finalAnswer ?? reply.content, complete: true,
+              verifyingCitations: false, sources: linkedSources,
+            } : reply
           ));
           setChatThreads(previous => {
             const thread = previous.find(item => item.id === id)
@@ -1077,12 +1080,16 @@ function App() {
         attachment?.basis,
         id,
         attachment?.sourceUrl,
+        () => setMessages(previous => previous.map(reply =>
+          reply.id === replyId ? { ...reply, verifyingCitations: true } : reply
+        )),
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : '问答请求失败，请稍后重试。';
       setMessages(previous => previous.map(reply =>
         reply.id === replyId
-          ? { ...reply, content: reply.content ? `${reply.content}\n\n${detail}` : detail, complete: true }
+          ? { ...reply, content: reply.content ? `${reply.content}\n\n${detail}` : detail,
+              complete: true, verifyingCitations: false }
           : reply
       ));
     } finally {
@@ -1105,13 +1112,13 @@ function App() {
     }
   }, [messages]);
 
-  // 初始化时自动调整textarea高度
-  useEffect(() => {
+  // Keep the composer compact again after sending or switching conversations.
+  useLayoutEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
     }
-  }, []);
+  }, [activeTab, inputValue]);
 
   return (
     <div className={`flex flex-col bg-gray-50 text-slate-900 transition-colors duration-300 dark:bg-slate-950 dark:text-slate-100 ${activeTab === 'ask' ? 'h-dvh overflow-hidden' : 'min-h-screen'}`}>
@@ -1124,10 +1131,6 @@ function App() {
           <h1 className="text-lg font-bold tracking-tight">NexusMind <span className="text-xs font-normal text-gray-400 bg-gray-100 dark:bg-slate-800 px-1.5 py-0.5 rounded ml-2">v2.1 Beta</span></h1>
         </div>
         <div className="flex items-center space-x-6">
-          <div className="flex items-center space-x-2 bg-gray-100 dark:bg-slate-800 px-3 py-1.5 rounded-full shadow-sm">
-            <Icon icon="simple-icons:deepseek" className="text-brand-500" />
-            <span className="text-sm font-medium">DeepSeek Flash</span>
-          </div>
           {/* 深色模式切换 */}
           <button
             className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-slate-800 transition-colors"
@@ -1330,22 +1333,33 @@ function App() {
                               {message.complete === false && !message.content ? (
                                 <p className="typing-cursor">正在思考...</p>
                               ) : (
-                                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                                <ReactMarkdown remarkPlugins={[remarkGfm, [remarkCitationLinks,
+                                  new Set(message.sources?.flatMap(source => source.citation_number === undefined ? [] : [source.citation_number])),
+                                  message.complete === false,
+                                ]]} components={{
                                   a: ({ href, children }) => {
-                                    const match = /^[^#]*#evidence-(\d+)$/.exec(href ?? '');
-                                    if (!match) return <a href={href}>{children}</a>;
-                                    const source = message.sources?.find(item => item.citation_number === Number(match[1]));
-                                    if (!source) return <span>{children}</span>;
-                                    return <button type="button" className="px-0.5 text-brand-600 underline"
-                                      aria-label={`查看引用 ${match[1]}`}
-                                      onClick={() => setReferenceFile({
-                                        id: source.id, filename: source.filename, versionId: source.version_id,
-                                        selectionId: ++citationSelection.current, sources: [source],
-                                      })}>{children}</button>;
+                                    const number = citationNumberFromHref(href);
+                                    if (number === undefined) return <a href={href}>{children}</a>;
+                                    const source = message.sources?.find(item => item.citation_number === number);
+                                    if (!source) return null;
+                                    const location = source.page_index === undefined ? '' : ` · 第 ${source.page_index + 1} 页`;
+                                    return <a href={`#evidence-${number}`} className="citation-badge"
+                                      aria-label={`查看引用 ${number}`}
+                                      title={`${source.filename}${location}`}
+                                      onClick={event => {
+                                        event.preventDefault();
+                                        setReferenceFile({
+                                          id: source.id, filename: source.filename, versionId: source.version_id,
+                                          selectionId: ++citationSelection.current, sources: [source],
+                                        });
+                                      }}>{number}</a>;
                                   },
                                 }}>
                                   {message.complete === false ? formatStreamingMarkdown(presentAnswer(message.content)) : presentAnswer(message.content)}
                                 </ReactMarkdown>
+                              )}
+                              {message.verifyingCitations && (
+                                <p role="status" className="text-xs text-slate-500 dark:text-slate-400">正在核验原文引用…</p>
                               )}
                             </div>
                           ) : (
@@ -1382,10 +1396,10 @@ function App() {
               </div>
 
               {/* 输入区 */}
-              <div className={`shrink-0 p-4 border-t border-gray-200 dark:border-slate-800 bg-white/50 dark:bg-slate-900/50 ${referenceFile ? "md:px-6" : "md:px-20"}`}>
-                <div className="max-w-4xl mx-auto relative">
+              <div className={`shrink-0 px-3 pb-3 pt-2 sm:px-5 sm:pb-4 ${referenceFile ? "lg:px-6" : "lg:px-12"}`}>
+                <div className="relative mx-auto max-w-4xl">
                   {/* 快捷指令预览 */}
-                  <div className={`absolute bottom-full left-0 mb-2 w-64 bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-gray-200 dark:border-slate-700 p-2 z-50 ${showCommandHint ? '' : 'hidden'}`} id="command-hint">
+                  <div className={`absolute bottom-full left-0 mb-2 w-64 max-w-full bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-gray-200 dark:border-slate-700 p-2 z-50 ${showCommandHint ? '' : 'hidden'}`} id="command-hint">
                     <div className="p-2 hover:bg-gray-100 dark:hover:bg-slate-700 rounded-lg cursor-pointer flex items-center justify-between group">
                       <div className="flex items-center space-x-2">
                         <Icon icon="solar:trash-bin-trash-bold" className="text-brand-500" />
@@ -1402,89 +1416,84 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="relative flex items-end bg-white dark:bg-slate-800 border-2 border-brand-100 dark:border-slate-700 focus-within:border-brand-500 shadow-xl rounded-2xl transition-all p-2">
-                    <Tooltip title="添加附件" trigger={['hover', 'focus']}>
-                    <button
-                      type="button"
-                      aria-label="添加附件"
-                      disabled={isLoading || historyLoading}
-                      className="p-2 text-gray-400 hover:text-brand-600 transition-colors disabled:opacity-50"
-                      onClick={() => {
-                        const fileInput = document.createElement('input');
-                        fileInput.type = 'file';
-                        fileInput.accept = '.pdf,.doc,.docx,.txt,.md';
-                        fileInput.onchange = async (e) => {
-                          const target = e.target as HTMLInputElement;
-                          if (target.files && target.files.length > 0) {
-                            setPendingAttachmentFile(target.files[0]);
-                            setShowAttachmentChoice(true);
-                          }
-                        };
-                        fileInput.click();
-                      }}
-                    >
-                      <Icon icon="solar:paperclip-line-duotone" className="text-2xl" />
-                    </button>
-                    </Tooltip>
-                    <Tooltip title="联网找论文" trigger={['hover', 'focus']}>
-                      <button type="button" aria-label="联网找论文" disabled={isLoading}
-                        className="shrink-0 p-2 text-gray-500 transition-colors hover:text-brand-600 disabled:opacity-50"
-                        onClick={() => setOnlinePaperSearchOpen(true)}>
-                        <Icon icon="solar:global-line-duotone" className="text-xl" />
-                      </button>
-                    </Tooltip>
+                  <div className="rounded-[22px] border border-slate-200 bg-white p-2 shadow-sm transition-colors focus-within:border-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:focus-within:border-slate-500">
+                    {chatAttachment && (
+                      <div className="mx-2 mb-1 mt-1 flex w-fit max-w-[calc(100%-1rem)] items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800">
+                        <Icon icon="solar:document-text-linear" className="shrink-0 text-base text-slate-500" aria-hidden="true" />
+                        <span className="min-w-0 truncate" title={chatAttachment.filename}>{chatAttachment.filename}</span>
+                        {chatAttachment.inLibrary && <span className="hidden shrink-0 text-slate-500 sm:inline dark:text-slate-400">已入库</span>}
+                        {chatAttachment.sourceUrl && <a href={chatAttachment.sourceUrl} target="_blank" rel="noreferrer"
+                          className="shrink-0 text-brand-600 underline dark:text-brand-400">来源</a>}
+                        <button type="button" aria-label="移除附件" onClick={() => setChatAttachment(null)}
+                          className="shrink-0 rounded px-1 text-base leading-none text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:hover:bg-slate-700 dark:hover:text-white">
+                          ×
+                        </button>
+                      </div>
+                    )}
                     <textarea
                       ref={textareaRef}
-                      className="w-full bg-transparent border-none focus:ring-0 text-sm py-2.5 max-h-32 hide-scrollbar resize-none font-medium"
+                      aria-label="输入消息"
+                      className="block max-h-32 min-h-11 w-full resize-none border-0 bg-transparent px-3 py-2 text-sm leading-6 text-slate-900 outline-none placeholder:text-slate-500 dark:text-slate-100 dark:placeholder:text-slate-400"
                       value={inputValue}
                       onChange={handleInputChange}
                       onKeyDown={handleInputKeyDown}
-                      placeholder="向你的知识库提问... (输入 / 获取命令)"
+                      placeholder="输入你的问题"
                       rows={1}
-                    ></textarea>
-                    <div className="flex items-center space-x-1 pr-1 pb-1">
-                      <button
-                        className={`flex items-center space-x-1 mr-2 px-2 py-1 rounded-lg transition-all ${ragEnabled ? 'bg-brand-100 dark:bg-brand-900/30' : 'bg-gray-100 dark:bg-slate-700'}`}
-                        onClick={() => setRagEnabled(!ragEnabled)}
-                      >
-                        <Icon
-                          icon="solar:database-bold-duotone"
-                          className={`${ragEnabled ? 'text-brand-600' : 'text-gray-500'}`}
-                        />
-                        <span className={`text-[10px] font-bold ${ragEnabled ? 'text-brand-600' : 'text-gray-500'}`}>
-                          {ragEnabled ? 'RAG On' : 'RAG Off'}
+                    />
+                    <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-1 pt-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-1">
+                        <Tooltip title="添加附件" trigger={['hover', 'focus']}>
+                          <button type="button" aria-label="添加附件" disabled={isLoading || historyLoading}
+                            className="grid size-8 shrink-0 place-items-center rounded-full text-xl text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                            onClick={() => {
+                              const fileInput = document.createElement('input');
+                              fileInput.type = 'file';
+                              fileInput.accept = '.pdf,.doc,.docx,.txt,.md';
+                              fileInput.onchange = () => {
+                                const file = fileInput.files?.[0];
+                                if (file) {
+                                  setPendingAttachmentFile(file);
+                                  setShowAttachmentChoice(true);
+                                }
+                              };
+                              fileInput.click();
+                            }}>
+                            <Icon icon="solar:paperclip-line-duotone" aria-hidden="true" />
+                          </button>
+                        </Tooltip>
+                        <Tooltip title="联网找论文" trigger={['hover', 'focus']}>
+                          <button type="button" aria-label="联网找论文" disabled={isLoading}
+                            className="grid size-8 shrink-0 place-items-center rounded-full text-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900 disabled:opacity-50 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-white"
+                            onClick={() => setOnlinePaperSearchOpen(true)}>
+                            <Icon icon="solar:global-line-duotone" aria-hidden="true" />
+                          </button>
+                        </Tooltip>
+                      </div>
+                      <div className="ml-auto flex min-w-0 items-center gap-1.5">
+                        <span className="flex min-w-0 items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium text-slate-600 dark:text-slate-300"
+                          title="当前模型：DeepSeek Flash">
+                          <Icon icon="simple-icons:deepseek" className="shrink-0 text-sm" aria-hidden="true" />
+                          <span className="truncate">DeepSeek Flash</span>
                         </span>
-                      </button>
-                      <button
-                        className="p-2 bg-brand-600 text-white rounded-xl shadow-lg shadow-brand-200 hover:bg-brand-700 transition-all group transform hover:scale-105"
-                        aria-label="发送消息"
-                        disabled={isLoading || historyLoading || !inputValue.trim()}
-                        onClick={() => void sendQuestion(inputValue)}
-                      >
-                        <Icon icon="solar:send-bold" className="text-xl group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
-                      </button>
+                        <Tooltip title={ragEnabled ? '关闭知识库检索' : '开启知识库检索'} trigger={['hover', 'focus']}>
+                          <button type="button" aria-label="知识库检索" aria-pressed={ragEnabled}
+                            className={`flex h-8 shrink-0 items-center gap-1 rounded-full border px-2 text-xs font-medium transition-colors ${ragEnabled
+                              ? 'border-slate-300 bg-slate-100 text-slate-800 hover:bg-slate-200 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700'
+                              : 'border-transparent text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                            onClick={() => setRagEnabled(value => !value)}>
+                            <Icon icon="solar:database-linear" className="text-sm" aria-hidden="true" />
+                            <span>RAG</span>
+                          </button>
+                        </Tooltip>
+                        <button type="button" aria-label="发送消息" title="发送消息"
+                          className="grid size-8 shrink-0 place-items-center rounded-full bg-slate-900 text-xl font-semibold leading-none text-white transition-colors hover:bg-slate-700 disabled:bg-slate-100 disabled:text-slate-400 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200 dark:disabled:bg-slate-800 dark:disabled:text-slate-500"
+                          disabled={isLoading || historyLoading || !inputValue.trim()}
+                          onClick={() => void sendQuestion(inputValue)}>
+                          <span aria-hidden="true">↑</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
-                  {chatAttachment && (
-                    <div className="flex items-center justify-between bg-brand-50 dark:bg-brand-900/20 border border-brand-200 dark:border-brand-800 rounded-lg px-3 py-2 mt-2">
-                      <div className="flex items-center space-x-2 min-w-0">
-                        <Icon icon="solar:document-text-bold" className="text-brand-600 shrink-0" />
-                        <span className="text-xs text-brand-700 dark:text-brand-300 truncate">📎 {chatAttachment.filename}</span>
-                        <span className="text-[10px] text-gray-500 shrink-0">
-                          {chatAttachment.inLibrary ? '已入库 · 随消息发送' : chatAttachment.basis === 'pdf' ? '开放 PDF' : chatAttachment.basis === 'abstract' ? '仅摘要' : '仅作为附件'}
-                        </span>
-                        {chatAttachment.sourceUrl && <a href={chatAttachment.sourceUrl} target="_blank" rel="noreferrer"
-                          className="shrink-0 text-xs text-brand-600 underline">来源</a>}
-                      </div>
-                      <button
-                        className="text-gray-400 hover:text-red-500 transition-colors shrink-0 ml-2"
-                        onClick={() => setChatAttachment(null)}
-                      >
-                        <Icon icon="solar:close-circle-bold" className="text-lg" />
-                      </button>
-                    </div>
-                  )}
-                  <p className="text-center text-[10px] text-gray-400 mt-2">使用 <kbd className="px-1 border rounded">Shift</kbd> + <kbd className="px-1 border rounded">Enter</kbd> 换行</p>
 
                   <OnlinePaperSearch open={onlinePaperSearchOpen} onClose={() => setOnlinePaperSearchOpen(false)}
                     onAttach={setChatAttachment}

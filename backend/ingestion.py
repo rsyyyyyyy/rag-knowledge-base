@@ -8,7 +8,7 @@ from uuid import uuid4
 import PyPDF2
 
 from search_text import index_text
-from pdf_evidence import extract_pdf_chunks, pdf_version
+from pdf_evidence import extract_pdf_chunks, pdf_version, PARSER_VERSION
 
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,8 @@ class Ingestion:
                 batch = records[start:start + 128]
                 self.collection.update(
                     ids=[chunk_id for chunk_id, _, _ in batch],
-                    metadatas=[metadata for _, _, metadata in batch],
+                    metadatas=[{k: v for k, v in metadata.items() if k not in {"source_map_json", "elements_json"}}
+                               for _, _, metadata in batch],
                 )
             rebuild = not records or (
                 path.suffix.lower() == ".pdf"
@@ -82,6 +83,7 @@ class Ingestion:
             self.store.adopt_legacy(doc_id, version, path, generation, records, rebuild)
             seen_generations[generation] = len(records)
         self.store.repair_missing_vectors(seen_generations)
+        self.store.queue_parser_upgrades(PARSER_VERSION)
         active = self.store.active_generations()
         for generation in seen_generations.keys() - active:
             self._delete_generation(generation)
@@ -164,7 +166,8 @@ class Ingestion:
                     ids=[chunk_id for chunk_id, _, _ in batch],
                     documents=texts,
                     embeddings=self.embed(texts),
-                    metadatas=[metadata for _, _, metadata in batch],
+                    metadatas=[{k: v for k, v in metadata.items() if k not in {"source_map_json", "elements_json"}}
+                               for _, _, metadata in batch],
                 )
             tokenized = [index_text(text) for _, text, _ in records]
             with self.index_lock:

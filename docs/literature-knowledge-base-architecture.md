@@ -103,7 +103,8 @@ flowchart LR
 - 开启知识库时，DeepSeek 先依据用户问题生成结构化路由，选择目录、概览、正文证据或通用回答。路由接收当前问题、会话工作状态、有界历史与当前文献目录，文件夹和文献名称在本地目录解析，并与请求的文献范围取交集。目录查询直接返回真实文件夹、文献或状态；同名与未匹配时给出相应提示。
 - 只提交准确文件名时，先确认当前选中文献，并询问概览、深读或比较任务。文献概览按研究问题、方法、结果、局限和适用场景组织，只陈述实际片段支持的内容。
 - 全文阅读与主题检索分流：`QuestionPlan.reading_mode` 由模型选择 `auto/full/local`。概览固定走全文；已明确文献 ID 的正文问答在 `auto/full` 下读取全文，明确局部问题用 `local`，未指定文献的主题问题用混合检索。文件夹和全文献概览不再抽取八篇、每篇十四个片段。`KnowledgeReadSession.read_documents` 在索引锁内一次取得当前范围全部活动代次片段，按文献及 `chunk_index` 排序，连同版本、页码及矩形保留原文证据，随后释放锁再调用模型。
-- `document_reading.py` 使用24,000 UTF-8字节作为保守的正文预算（不是模型最大上下文声明，另留问题、历史和输出空间）。短文直接将全部正文交给最终模型；长文逐批阅读、生成围绕本题的带引用笔记，必要时递归汇总到预算内。每批和超长片段均完整处理。模型返回结构化笔记和每条1至3个来源编号，后端校验范围并生成引用链接，失败时最多重试一次；原始编号跨批次保持不变，禁止把中间摘要当作 PDF 原文。汇总后按剩余预算补充笔记所引用的原始片段，供最终回答核验数据和措辞。中间结果为空、截断、引用越界或未收敛时返回明确错误，不报告阅读成功。API 非流式响应和 NDJSON `end` 的 `reading` 返回已读取片段数、总片段数、文献数及汇总轮数；用量计入全部阅读调用。
+- `document_reading.py` 使用 24,000 UTF-8 字节作为正文预算，另留问题、历史和输出空间。短文直接提交正文，长文按预算逐批生成带引用的结构化笔记，必要时递归汇总。每批使用连续的来源编号，服务端逐条校验笔记并映射回原始片段。批次输出为空、截断或引用越界时最多重试一次。仍未通过校验时，保留有效笔记并用对应文献的原文节选补充。汇总超出预算且无法继续收敛时，使用预算内的原文节选继续回答。汇总后按剩余预算补充所引用的原始片段，用于核验数据和措辞。API 非流式响应和 NDJSON `end` 的 `reading.partial` 表示本轮使用了节选补充，回答说明可能遗漏细节。用量计入全部阅读调用。
+- 流式问答在路由规划和全文阅读之前建立 NDJSON 响应，等待期间每 10 秒发送 `heartbeat`，前端忽略该事件。正文、引用核验和会话保存沿用既有事件协议，准备阶段的异常转换为 `error` 事件。
 - 全文指**全部已解析正文**，不包含未提取的扫描图像或图表。长文先阅读后流式生成最终回答，首字等待及模型用量会增加；分层笔记存在信息压缩，可定向追问回读原文。阅读范围计数和汇总过程仅保留在接口诊断数据中，不加入答案；前端兼容隐藏旧会话中的相应提示。最终模型提示要求直接回答，不输出内部流程。引用始终使用原始片段与既有 PDF 坐标，正文来源按文件聚合，点击编号仅定位该原文片段。局部检索对排名靠前的四个片段扩展左右相邻片段，避免语义边界被分片切断。
 - 实现借鉴 LlamaIndex 的整篇节点读取与递归汇总、Haystack 的命中上下文扩展，未复制上游代码。[SummaryIndexRetriever](https://github.com/run-llama/llama_index/blob/99d7433f6f71888951379ccca9294e272442c832/llama-index-core/llama_index/core/indices/list/retrievers.py) · [TreeSummarize](https://github.com/run-llama/llama_index/blob/99d7433f6f71888951379ccca9294e272442c832/llama-index-core/llama_index/core/response_synthesizers/tree_summarize.py) · [SentenceWindowRetriever](https://github.com/deepset-ai/haystack/blob/a08e4e981c20eff63a99e5a9c3a207bea089a2ce/haystack/components/retrievers/sentence_window_retriever.py)
 - 问答默认并行执行 FTS5/BM25 与 BGE 向量召回，再以 RRF 合并。FTS5 使用相同的中文分词规则处理片段及查询，并保留英文缩写、编号和 DOI。升级时从 SQLite 已有片段重建全文索引，无需重新嵌入或上传。
@@ -112,11 +113,19 @@ flowchart LR
 
 会话状态与证据状态分别参考 RAGFlow 的运行会话和 Haiku.RAG 的 evidence ledger。当前实现继续沿用项目已有 FastAPI 与 SQLite，对应逻辑位于 chat_history.py 和 conversation_state.py。记忆用于确定阅读对象和任务，实际文献结论重新读取来源，来源版本改变时提示重新选择。[RAGFlow 运行会话](https://github.com/infiniflow/ragflow/blob/db1cd5929a7885a3074547791f5ecc4d2f891739/internal/agentic_rag/run_session.go) · [Haiku.RAG 证据状态](https://github.com/ggozad/haiku.rag/blob/76e6b325b8c94eb5a234df27370ade3c1862032a/haiku_rag_slim/haiku/rag/capabilities/ledger.py)
 
-### 引用质量调研与下一步改造（待实现）
+### 引用证据链（当前实现）
 
-当前 PDF 解析以行矩形为基础，双栏分块产生过多短行块；当前全文回答引用尚缺逐条论断的原文支持核验。后续应分别保存文档元素（页码/矩形/文本偏移）、语义段落阅读块、精确证据 span，避免把一次阅读的大块直接当成最小引用。先恢复段落与章节结构，再按 token 预算合并/切分；表格保留表头与说明。重排后扩展父段上下文，回答通过 claim + verbatim quote + source span 关联来源；校验引句真实存在、版本一致，并核查它是否直接支持论断。相似度或编号有效只能证明候选关联，不能代替支持性判断。
+解析继续使用 pdfplumber 的原页坐标链路，借鉴结构化文档元素与证据登记思路，不叠加另一个 Agent 框架。`pdf_evidence.py` 根据持续栏间空白推断双栏，按字体、行距和缩进归并段落及章节，保留可检测的线框表格边界。阅读块按 `cl100k_base` 的384 token预算切分/合并；这是明确的分块计量规则，不是 DeepSeek 计费或相关性阈值。过长元素按句子或词边界分段，保留全部字符。块保持页内范围，附带章节、元素ID、元素内偏移、文字哈希，以及行/词矩形与字符偏移映射。英文按词定位，中文按字定位；连字通过NFKC对齐，仅在文字与字形无损对应时提供词矩形，否则降级为行定位；精细映射仅写SQLite，不复制到Chroma。无框表格、复杂公式及图像仍可能只能保留文字，不声称完整恢复其语义结构。
 
-本次只完成展示调整及源码调研，未改变解析器或批量重建索引。参考实现：[Haiku.RAG 结构化切分](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/chunkers/docling_local.py)、[原文元素定位](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/client/search.py)、[Kotaemon 引句匹配](https://github.com/Cinnamon/kotaemon/blob/9ad3e4e49aa35b8acddd235918a5d9753c1cfdf9/libs/kotaemon/kotaemon/indices/qa/citation_qa_inline.py)、[RAGFlow PDF合并与切分](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/ingestion/component/chunker/general.go)、[RAGFlow证据登记](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/agentic_rag/evidence_registry.go)。
+阅读块、回答论断、引用证据独立处理。`evidence_grounding.py` 在生成后对每个引用出现位置提取对应论断，读取所指块及邻接原文，由模型返回支持判断和逐字引句。引句须在原文中唯一匹配，论断须来自回答，版本与文字哈希须一致；显式数值必须能在引句中找到。不足时仅在同一文献、同一版本内定向混合检索并补读，再核验一次。同一论断已有其他可靠引句时移除冗余的不支持引用；整条论断仍无可靠证据时，将原断言改为依据不足提示，不保留未经核实的数值或附可点击链接。模型的支持判断是概率性检查，不是事实正确性的形式证明；数值字面校验保守处理，推算型结论可能需要后续显式推导证据支持。
+
+通过核验的来源保存 `span_id`、`claim`、`excerpt_start/end`、`element_refs`、原文版本、页码和仅覆盖引句的矩形；同一证据去重，编号从1紧凑排列。没有精细映射的旧证据按行或页降级，不伪称精确到词。最终可点击引用只来自这些来源，历史引用记录保留自带的旧版本和矩形。
+
+NDJSON继续流式发送正文草稿，核验后发送 `answer` 事件作为最终权威正文，随后发送通过核验的 `sources` 与 `end`；前端替换草稿正文，持久化同一最终答案。非流式接口直接返回最终答案。`end.grounding` 记录核验与补读数量，计费包含核验调用，内部指标不显示在回答。核验服务失败不保存该轮，返回明确错误。
+
+解析器带 `paragraph-spans-v3` 版本。启动时为旧PDF索引排队一次升级，同一文献不重复排队；构建期间沿用旧活动代次，成功后原子切换，失败保留旧索引。原文件与聊天记录不因升级删除。重新登记时若精细映射缺失，也会重建，避免将缺失映射的索引误认成已升级。
+
+参考实现：[Haiku.RAG 结构化切分](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/chunkers/docling_local.py)、[原文元素定位](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/client/search.py)、[Kotaemon 引句匹配](https://github.com/Cinnamon/kotaemon/blob/9ad3e4e49aa35b8acddd235918a5d9753c1cfdf9/libs/kotaemon/kotaemon/indices/qa/citation_qa_inline.py)、[RAGFlow PDF合并与切分](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/ingestion/component/chunker/general.go)、[RAGFlow证据登记](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/agentic_rag/evidence_registry.go)。
 
 ## 7 迁移、开发顺序与验收
 

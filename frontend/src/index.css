@@ -89,6 +89,45 @@ body {
   margin-block-start: 0.75rem;
 }
 
+.chat-markdown .citation-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 1.4rem;
+  margin-inline: 0.18em;
+  padding: 0.17em 0.45em;
+  border: 1px solid #3730a3;
+  border-radius: 9999px;
+  background: #4338ca;
+  color: #fff;
+  font-size: 0.8em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  vertical-align: 0.12em;
+  text-decoration: none;
+}
+
+.chat-markdown .citation-badge:hover {
+  background: #3730a3;
+  border-color: #312e81;
+}
+
+.chat-markdown .citation-badge:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+.dark .chat-markdown .citation-badge {
+  background: #4f46e5;
+  border-color: #818cf8;
+}
+
+.dark .chat-markdown .citation-badge:hover {
+  background: #4338ca;
+  border-color: #a5b4fc;
+}
+
 .chat-markdown strong,
 .chat-markdown h1,
 .chat-markdown h2,

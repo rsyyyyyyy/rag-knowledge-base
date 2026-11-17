@@ -236,6 +236,30 @@ class IngestStore:
                 if not pending:
                     self._enqueue(db, doc_id, version_id)
 
+    def queue_parser_upgrades(self, parser_version):
+        """Reindex PDFs atomically on parser upgrades; retain old indexes until publish."""
+        count = 0
+        with self.transaction() as db:
+            for doc_id, version, generation, path in db.execute("""
+                SELECT a.doc_id, a.version_id, a.generation, v.path
+                FROM active_indexes a JOIN document_versions v USING(doc_id, version_id)
+            """).fetchall():
+                if Path(path).suffix.lower() != ".pdf":
+                    continue
+                current = db.execute("""
+                    SELECT json_extract(metadata, '$.parser_version'),
+                           json_extract(metadata, '$.source_map_json') FROM indexed_chunks
+                    WHERE generation = ? LIMIT 1
+                """, (generation,)).fetchone()
+                if current and current[0] == parser_version and current[1]:
+                    continue
+                if db.execute("SELECT 1 FROM ingest_jobs WHERE doc_id = ? AND state IN ('queued','processing')",
+                              (doc_id,)).fetchone():
+                    continue
+                self._enqueue(db, doc_id, version)
+                count += 1
+        return count
+
     def registered_documents(self):
         with self.catalog.connect() as db:
             return {row[0] for row in db.execute("SELECT DISTINCT doc_id FROM document_versions")}
