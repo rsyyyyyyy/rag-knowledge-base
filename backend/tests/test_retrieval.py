@@ -41,7 +41,9 @@ class RetrievalIntegrationTest(TestCase):
     def test_retrieval_and_evidence(self):
         with tempfile.TemporaryDirectory(prefix="rag-retrieval-", ignore_cleanup_errors=True) as directory:
             previous = os.environ.get("RAG_DATA_DIR")
+            previous_auto_metadata = os.environ.get("RAG_AUTO_METADATA")
             os.environ["RAG_DATA_DIR"] = directory
+            os.environ["RAG_AUTO_METADATA"] = "0"
             try:
                 import app
 
@@ -53,6 +55,10 @@ class RetrievalIntegrationTest(TestCase):
                     os.environ.pop("RAG_DATA_DIR", None)
                 else:
                     os.environ["RAG_DATA_DIR"] = previous
+                if previous_auto_metadata is None:
+                    os.environ.pop("RAG_AUTO_METADATA", None)
+                else:
+                    os.environ["RAG_AUTO_METADATA"] = previous_auto_metadata
 
     def exercise(self, client):
         def checked(response, status=200):

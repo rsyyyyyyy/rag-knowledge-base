@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
-import { Modal, Input, Select, Tooltip, message } from 'antd';
-import type { ChatThread, ChatTurn, Source } from './services/api';
+import { Modal, Input, Select, Tooltip, Dropdown, message } from 'antd';
+import type { ChatThread, ChatTurn, DocumentOutlineItem, PdfAnnotation, Source } from './services/api';
 import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/OnlinePaperSearch';
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
-import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocumentOutline, getDocumentAnnotations, createDocumentAnnotation, deleteDocumentAnnotation, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary, enrichDocumentMetadata, updateDocumentMetadata } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -15,6 +15,10 @@ import type { PdfNavigation, PdfPageJump } from './components/PdfReferencePrevie
 
 const PdfReferencePreview = React.lazy(() => import('./components/PdfReferencePreview'));
 const noPdfSources: Source[] = [];
+type PdfDirectoryItem = PdfPageJump & { level: number };
+type AnnotationHistoryEntry =
+  | { type: 'create'; id: string }
+  | { type: 'delete'; annotation: PdfAnnotation };
 
 function clampSummaryWidth(width: number) {
   return Math.max(16, Math.min(40, width));
@@ -89,22 +93,6 @@ function App() {
     return `${(size / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const formatDate = (dateString: string) => {
-    if (!dateString) return '-';
-    try {
-      const date = new Date(dateString);
-      return date.toLocaleString('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit'
-      });
-    } catch (error) {
-      return '-';
-    }
-  };
-
 
 
   const [activeTab, setActiveTab] = useState('ask');
@@ -143,15 +131,31 @@ function App() {
   const [documentViewLoading, setDocumentViewLoading] = useState(false);
   const [documentViewError, setDocumentViewError] = useState('');
   const [summaryWidth, setSummaryWidth] = useState(20);
+  const [isDirectoryCollapsed, setIsDirectoryCollapsed] = useState(false);
   const summaryDrag = useRef<{ x: number; width: number; containerWidth: number } | null>(null);
   const [pdfNavigation, setPdfNavigation] = useState<PdfNavigation | null>(null);
   const [pdfPageJump, setPdfPageJump] = useState<PdfPageJump | null>(null);
+  const [outlineItems, setOutlineItems] = useState<DocumentOutlineItem[]>([]);
+  const outlineRequest = useRef(0);
+  const [annotations, setAnnotations] = useState<PdfAnnotation[]>([]);
+  const annotationsRequest = useRef(0);
+  const [viewerPanel, setViewerPanel] = useState<'summary' | 'annotations'>('summary');
+  const annotationHistory = useRef<AnnotationHistoryEntry[]>([]);
+  const [canUndo, setCanUndo] = useState(false);
   const handlePdfPreviewError = useCallback(() => setDocumentViewError('无法加载 PDF 原件。'), []);
-  const pdfDirectory = pdfNavigation?.bookmarks.length
-    ? pdfNavigation.bookmarks
-    : Array.from({ length: pdfNavigation?.totalPages ?? 0 }, (_, pageIndex) => ({
-        title: `第 ${pageIndex + 1} 页`, level: 0, pageIndex,
-      }));
+  const bookmarkDirectory = pdfNavigation?.bookmarks ?? [];
+  const generatedDirectory = outlineItems.map(item => ({
+    title: item.title, level: item.level, pageIndex: item.page_index,
+  }));
+  const useBookmarks = bookmarkDirectory.length >= 5;
+  const hasOutline = useBookmarks || generatedDirectory.length > 0;
+  const pdfDirectory: PdfDirectoryItem[] = useBookmarks
+    ? bookmarkDirectory
+    : generatedDirectory.length
+      ? generatedDirectory
+      : Array.from({ length: pdfNavigation?.totalPages ?? 0 }, (_, pageIndex) => ({
+          title: `第 ${pageIndex + 1} 页`, level: 0, pageIndex,
+        }));
   // 智能总结状态
   const [summary, setSummary] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState<boolean>(false);
@@ -169,13 +173,21 @@ function App() {
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
   const [isCopyModalOpen, setIsCopyModalOpen] = useState(false);
   const [targetFolderId, setTargetFolderId] = useState('');
-  const [isGridView, setIsGridView] = useState(true);
+  const [isGridView, setIsGridView] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [documentPage, setDocumentPage] = useState(1);
+  const [documentPageSize, setDocumentPageSize] = useState(20);
   const [searchQuery, setSearchQuery] = useState('');
   const [isRenameFileModalOpen, setIsRenameFileModalOpen] = useState(false);
   const [renameFileId, setRenameFileId] = useState('');
   const [renameFileName, setRenameFileName] = useState('');
   const [isEditFileModalOpen, setIsEditFileModalOpen] = useState(false);
   const [editFileId, setEditFileId] = useState('');
+  const [isMetadataModalOpen, setIsMetadataModalOpen] = useState(false);
+  const [metadataDocId, setMetadataDocId] = useState('');
+  const [metadataSaving, setMetadataSaving] = useState(false);
+  const [metadataEnriching, setMetadataEnriching] = useState(false);
+  const [metadataForm, setMetadataForm] = useState({ title: '', authors: '', year: '', venue: '', doi: '' });
   const [isPermissionModalOpen, setIsPermissionModalOpen] = useState(false);
   const [permissionFileId, setPermissionFileId] = useState('');
   const [filePermission, setFilePermission] = useState('private'); // private, shared, public
@@ -505,6 +517,141 @@ function App() {
         return [...prev, docId];
       }
     });
+  };
+
+  const metadataText = (value: unknown) => typeof value === 'string' ? value.trim() : '';
+  const documentTitle = (doc: Document) => metadataText(doc.metadata.title) || doc.metadata.filename;
+  const documentAuthors = (doc: Document) => {
+    if (Array.isArray(doc.metadata.authors)) {
+      const authors = doc.metadata.authors.map(author => metadataText(author)).filter(Boolean);
+      return authors.length ? authors.join('、') : '—';
+    }
+    return metadataText(doc.metadata.author) || '—';
+  };
+  const documentYear = (doc: Document) => {
+    const year = doc.metadata.year;
+    return typeof year === 'string' || typeof year === 'number' ? String(year) : '—';
+  };
+  const documentVenue = (doc: Document) => (
+    metadataText(doc.metadata.venue)
+    || metadataText(doc.metadata.journal)
+    || metadataText(doc.metadata.source)
+    || '—'
+  );
+  const documentDoi = (doc: Document) => metadataText(doc.metadata.doi);
+  const documentFolder = (doc: Document) => {
+    const folderId = metadataText(doc.metadata.folder_id);
+    if (!folderId) return '默认文件夹';
+    return folders.find(folder => folder.id === folderId)?.name || '—';
+  };
+  const documentTags = (doc: Document) => (
+    Array.isArray(doc.metadata.tags)
+      ? doc.metadata.tags.map(tag => metadataText(tag)).filter(Boolean)
+      : []
+  );
+  const formatDay = (value: string) => {
+    if (!value) return '—';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleDateString('zh-CN');
+  };
+  const ingestionLabels: Record<string, string> = {
+    queued: '等待入库', processing: '正在入库', parsed: '可检索',
+    failed: '入库失败', no_text_extracted: '未提取到文本', stored_only: '原件已保存',
+  };
+  const ingestionStyles: Record<string, string> = {
+    queued: 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+    processing: 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+    parsed: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+    failed: 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300',
+    no_text_extracted: 'bg-orange-50 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300',
+    stored_only: 'bg-gray-100 text-gray-600 dark:bg-slate-800 dark:text-slate-300',
+  };
+  const toggleFavoriteDocument = async (doc: Document) => {
+    try {
+      await toggleDocumentFavorite(doc.id, !doc.metadata.is_favorite);
+      const docs = await getDocuments();
+      setDocuments(docs);
+      setFavoriteDocuments(docs.filter(item => item.metadata.is_favorite));
+    } catch {
+      message.error('更新收藏状态失败');
+    }
+  };
+
+  const refreshDocuments = async () => {
+    const docs = await getDocuments();
+    setDocuments(docs);
+    setRecentDocuments([...docs].sort((a, b) => {
+      const left = new Date((a.metadata.last_accessed_at as string) || a.metadata.uploaded_at).getTime();
+      const right = new Date((b.metadata.last_accessed_at as string) || b.metadata.uploaded_at).getTime();
+      return right - left;
+    }).slice(0, 5));
+    setFavoriteDocuments(docs.filter(item => item.metadata.is_favorite));
+    return docs;
+  };
+
+  const runMetadataEnrichment = async (docIds?: string[], force = false) => {
+    if (metadataEnriching) return;
+    setMetadataEnriching(true);
+    try {
+      let updated = 0;
+      let remaining = 0;
+      let rounds = 0;
+      do {
+        const result = await enrichDocumentMetadata(docIds, force, 10);
+        updated += result.updated.length;
+        remaining = result.remaining;
+        rounds += 1;
+      } while (!docIds && !force && remaining > 0 && rounds < 5);
+      await refreshDocuments();
+      if (updated > 0) {
+        message.success(`已补全 ${updated} 篇文献的元数据。${remaining > 0 ? `还有 ${remaining} 篇可继续补全。` : ''}`);
+      } else {
+        message.info(force ? '没有识别到新的元数据。' : '没有需要补全的文献。');
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '补全元数据失败。');
+    } finally {
+      setMetadataEnriching(false);
+    }
+  };
+
+  const openMetadataEditor = (doc: Document) => {
+    const authors = Array.isArray(doc.metadata.authors)
+      ? doc.metadata.authors.map(author => metadataText(author)).filter(Boolean).join('、')
+      : metadataText(doc.metadata.author);
+    setMetadataDocId(doc.id);
+    setMetadataForm({
+      title: metadataText(doc.metadata.title),
+      authors,
+      year: doc.metadata.year === undefined || doc.metadata.year === null ? '' : String(doc.metadata.year),
+      venue: metadataText(doc.metadata.venue) || metadataText(doc.metadata.journal) || metadataText(doc.metadata.source),
+      doi: metadataText(doc.metadata.doi),
+    });
+    setIsMetadataModalOpen(true);
+  };
+
+  const handleMetadataSubmit = async () => {
+    if (!metadataDocId || metadataSaving) return;
+    setMetadataSaving(true);
+    try {
+      const { document: updated } = await updateDocumentMetadata(metadataDocId, {
+        title: metadataForm.title.trim() || undefined,
+        authors: metadataForm.authors.trim() || undefined,
+        year: metadataForm.year.trim() || undefined,
+        venue: metadataForm.venue.trim() || undefined,
+        doi: metadataForm.doi.trim() || undefined,
+      });
+      const applyUpdate = (list: Document[]) => list.map(doc => doc.id === updated.id ? updated : doc);
+      setDocuments(applyUpdate);
+      setRecentDocuments(applyUpdate);
+      setFavoriteDocuments(applyUpdate);
+      setIsMetadataModalOpen(false);
+      message.success('元数据已保存。');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '保存元数据失败。');
+    } finally {
+      setMetadataSaving(false);
+    }
   };
 
   // 打开移动文件模态框
@@ -848,6 +995,20 @@ function App() {
     setIsDrawerOpen(true);
     setDocumentViewLoading(true);
     setDocumentViewError('');
+    const outlineId = ++outlineRequest.current;
+    setOutlineItems([]);
+    const annotationId = ++annotationsRequest.current;
+    setAnnotations([]);
+    annotationHistory.current = [];
+    setCanUndo(false);
+    setViewerPanel('summary');
+    if (String(doc.metadata.file_type).toLowerCase() === '.pdf') {
+      void getDocumentOutline(doc.id).then(items => {
+        if (outlineId === outlineRequest.current) setOutlineItems(items);
+      }).catch(() => {
+        if (outlineId === outlineRequest.current) setOutlineItems([]);
+      });
+    }
     // 清空之前的总结状态
     setSummary(null);
     setSummaryError(null);
@@ -865,7 +1026,17 @@ function App() {
     }).catch(() => {});
     try {
       const view = await getDocumentView(doc.id, false);
-      if (request === documentViewRequest.current) setDocumentView(view);
+      if (request === documentViewRequest.current) {
+        setDocumentView(view);
+        if (view.view_type === 'pdf' && view.version_id) {
+          const versionId = view.version_id;
+          void getDocumentAnnotations(doc.id, versionId).then(items => {
+            if (annotationId === annotationsRequest.current) setAnnotations(items);
+          }).catch(() => {
+            if (annotationId === annotationsRequest.current) setAnnotations([]);
+          });
+        }
+      }
     } catch (error) {
       if (request !== documentViewRequest.current) return;
       setDocumentView(null);
@@ -1120,6 +1291,114 @@ function App() {
     }
   }, [activeTab, inputValue]);
 
+  const activePdfVersionId = typeof documentView?.version_id === 'string'
+    ? documentView.version_id : undefined;
+  const visibleAnnotations = annotations.filter(annotation => annotation.kind !== 'note');
+
+  const pushAnnotationHistory = useCallback((entry: AnnotationHistoryEntry) => {
+    annotationHistory.current.push(entry);
+    if (annotationHistory.current.length > 50) annotationHistory.current.shift();
+    setCanUndo(true);
+  }, []);
+
+  const undoAnnotation = useCallback(async () => {
+    const entry = annotationHistory.current.pop();
+    if (!entry) {
+      setCanUndo(false);
+      return;
+    }
+    if (!selectedDocument || !activePdfVersionId) {
+      setCanUndo(annotationHistory.current.length > 0);
+      return;
+    }
+    try {
+      if (entry.type === 'create') {
+        await deleteDocumentAnnotation(selectedDocument.id, entry.id);
+        setAnnotations(previous => previous.filter(item => item.id !== entry.id));
+      } else if (entry.type === 'delete') {
+        const restored = await createDocumentAnnotation(selectedDocument.id, activePdfVersionId, {
+          page_index: entry.annotation.page_index,
+          kind: entry.annotation.kind,
+          color: entry.annotation.color,
+          rects: entry.annotation.rects,
+          quote: entry.annotation.quote,
+          note: entry.annotation.note,
+        });
+        setAnnotations(previous => [...previous, restored]);
+      }
+    } catch (error) {
+      annotationHistory.current.push(entry);
+      message.error(error instanceof Error ? error.message : '撤销失败。');
+    } finally {
+      setCanUndo(annotationHistory.current.length > 0);
+    }
+  }, [selectedDocument, activePdfVersionId]);
+
+  const removeAnnotation = useCallback(async (id: string) => {
+    if (!selectedDocument) return;
+    const target = annotations.find(item => item.id === id);
+    try {
+      await deleteDocumentAnnotation(selectedDocument.id, id);
+      setAnnotations(previous => previous.filter(item => item.id !== id));
+      if (target) {
+        // A delete supersedes earlier undo entries for the same annotation.
+        annotationHistory.current = annotationHistory.current.filter(
+          entry => !('id' in entry && entry.id === id),
+        );
+        pushAnnotationHistory({ type: 'delete', annotation: target });
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除标注失败。');
+      throw error;
+    }
+  }, [annotations, selectedDocument, pushAnnotationHistory]);
+
+  useEffect(() => {
+    const handleUndoShortcut = (event: KeyboardEvent) => {
+      if (!isDrawerOpen) return;
+      if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.key.toLowerCase() !== 'z') return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+      event.preventDefault();
+      void undoAnnotation();
+    };
+    window.addEventListener('keydown', handleUndoShortcut);
+    return () => window.removeEventListener('keydown', handleUndoShortcut);
+  }, [isDrawerOpen, undoAnnotation]);
+
+  const documentStats = {
+    total: documents.length,
+    searchable: documents.filter(doc => doc.metadata.searchable || doc.metadata.status === 'parsed').length,
+    pending: documents.filter(doc => isIngestionPending(doc.metadata.status)).length,
+    failed: documents.filter(doc => doc.metadata.status === 'failed' || doc.metadata.status === 'no_text_extracted').length,
+  };
+  const listedDocuments = filterType === 'recent' ? recentDocuments
+    : filterType === 'favorite' ? favoriteDocuments : documents;
+  const filteredDocuments = listedDocuments.filter(doc => (
+    statusFilter === 'all' ? true
+      : statusFilter === 'pending' ? isIngestionPending(doc.metadata.status)
+        : statusFilter === 'failed' ? doc.metadata.status === 'failed' || doc.metadata.status === 'no_text_extracted'
+          : doc.metadata.status === statusFilter
+  ));
+  useEffect(() => {
+    setDocumentPage(1);
+  }, [filterType, statusFilter, documentPageSize]);
+  const totalDocumentPages = Math.max(1, Math.ceil(filteredDocuments.length / documentPageSize));
+  const currentDocumentPage = Math.min(documentPage, totalDocumentPages);
+  const pagedDocuments = filteredDocuments.slice(
+    (currentDocumentPage - 1) * documentPageSize,
+    currentDocumentPage * documentPageSize,
+  );
+  const toggleSelectAllDocuments = () => {
+    const ids = pagedDocuments.map(doc => doc.id);
+    const allSelected = ids.length > 0 && ids.every(id => selectedDocuments.includes(id));
+    setSelectedDocuments(previous => allSelected
+      ? previous.filter(id => !ids.includes(id))
+      : [...new Set([...previous, ...ids])]);
+  };
+
   return (
     <div className={`flex flex-col bg-gray-50 text-slate-900 transition-colors duration-300 dark:bg-slate-950 dark:text-slate-100 ${activeTab === 'ask' ? 'h-dvh overflow-hidden' : 'min-h-screen'}`}>
       {/* 顶栏：技术感知与状态 */}
@@ -1320,7 +1599,7 @@ function App() {
                 ) : (
                   /* 消息列表 */
                   messages.map((message, index) => (
-                    <div key={index} className={`flex space-x-4 max-w-4xl ${message.role === 'user' ? 'justify-end' : ''}`}>
+                    <div key={index} className={`mx-auto flex w-full max-w-4xl space-x-4 ${message.role === 'user' ? 'justify-end' : ''}`}>
                       {message.role === 'assistant' && (
                         <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center shrink-0">
                           <Icon icon="solar:magic-stick-3-bold" className="text-white" />
@@ -1382,7 +1661,7 @@ function App() {
 
                 {/* 加载状态 */}
                 {isLoading && messages.at(-1)?.complete !== false && (
-                  <div className="flex space-x-4 max-w-4xl">
+                  <div className="mx-auto flex w-full max-w-4xl space-x-4">
                     <div className="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center shrink-0">
                       <Icon icon="solar:magic-stick-3-bold" className="text-white" />
                     </div>
@@ -1567,7 +1846,29 @@ function App() {
                     <span>知识库管理</span>
                   </h3>
                 </div>
-                <div className="flex items-center space-x-2">
+                <div className="flex items-center gap-4">
+                  <div className="hidden items-center gap-3 text-xs text-gray-500 md:flex dark:text-slate-400">
+                    <span>共 <b className="text-sm text-slate-800 dark:text-slate-100">{documentStats.total}</b> 篇</span>
+                    <span>可检索 <b className="text-sm text-emerald-600">{documentStats.searchable}</b></span>
+                    {documentStats.pending > 0 && (
+                      <span>处理中 <b className="text-sm text-blue-600">{documentStats.pending}</b></span>
+                    )}
+                    {documentStats.failed > 0 && (
+                      <span>失败 <b className="text-sm text-red-600">{documentStats.failed}</b></span>
+                    )}
+                  </div>
+                  <button
+                    className="flex items-center gap-1.5 rounded-lg bg-brand-600 px-3 py-2 text-sm font-bold text-white transition-colors hover:bg-brand-700"
+                    onClick={() => {
+                      if (fileInputRef.current) {
+                        fileInputRef.current.value = '';
+                        fileInputRef.current.click();
+                      }
+                    }}
+                  >
+                    <Icon icon="solar:upload-bold" />
+                    <span>上传文献</span>
+                  </button>
                   <input
                     type="file"
                     id="file-upload"
@@ -1577,7 +1878,6 @@ function App() {
                     onChange={handleFileSelect}
                     className="hidden"
                   />
-
                 </div>
               </div>
 
@@ -1598,9 +1898,9 @@ function App() {
               </div>
 
               <div className="flex-1 bg-gray-100 dark:bg-slate-900 p-4 md:p-6 overflow-auto">
-                <div className="max-w-6xl mx-auto space-y-4 md:space-y-6">
+                <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[14rem_minmax(0,1fr)] lg:items-start">
                   {/* 文件夹管理 */}
-                  <div className="bg-white dark:bg-slate-800 rounded-xl shadow-md border border-gray-200 dark:border-slate-700 p-3 md:p-4">
+                  <aside className="h-fit rounded-xl border border-gray-200 bg-white p-3 shadow-md md:p-4 lg:sticky lg:top-0 dark:border-slate-700 dark:bg-slate-800">
                     <div className="flex items-center justify-between mb-4">
                       <h4 className="text-sm font-bold flex items-center space-x-2">
                         <Icon icon="solar:folder-bold" className="text-brand-600" />
@@ -1616,18 +1916,19 @@ function App() {
                     <div className="space-y-2">
                       <FolderList />
                     </div>
-                  </div>
+                  </aside>
 
                   {/* 文件管理 */}
                   <div className="bg-white dark:bg-slate-800 rounded-xl shadow-md border border-gray-200 dark:border-slate-700 p-3 md:p-4">
-                    <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-3 space-y-3 md:space-y-0">
-                      <h4 className="text-sm font-bold flex items-center space-x-2">
+                    <div className="mb-3 flex flex-col gap-2">
+                      <h4 className="flex items-center space-x-2 text-sm font-bold">
                         <Icon icon="solar:file-text-bold-duotone" className="text-brand-600" />
-                        <span>文件</span>
+                        <span>文献</span>
+                        <span className="text-xs font-normal text-gray-400">{filteredDocuments.length} 篇</span>
                       </h4>
-                      <div className="flex flex-col md:flex-row items-center space-y-2 md:space-y-0 md:space-x-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         {/* 搜索框 */}
-                        <div className="relative w-full md:w-64">
+                        <div className="relative w-full sm:w-56">
                           <input
                             type="text"
                             placeholder="搜索文件..."
@@ -1660,6 +1961,17 @@ function App() {
                             <option value="favorite">我的收藏</option>
                           </select>
                         </div>
+                        {/* 入库状态筛选 */}
+                        <select
+                          value={statusFilter}
+                          onChange={(event) => setStatusFilter(event.target.value)}
+                          className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+                        >
+                          <option value="all">全部状态</option>
+                          <option value="parsed">可检索</option>
+                          <option value="pending">处理中</option>
+                          <option value="failed">失败/无文本</option>
+                        </select>
                         {/* 排序选项 */}
                         <div className="flex items-center space-x-2">
                           <select
@@ -1670,7 +1982,8 @@ function App() {
                             }}
                             className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
                           >
-                            <option value="uploaded_at">时间</option>
+                            <option value="uploaded_at">上传时间</option>
+                            <option value="year">出版年份</option>
                             <option value="filename">名称</option>
                             <option value="size">大小</option>
                           </select>
@@ -1703,6 +2016,36 @@ function App() {
                           <option value=".txt">TXT</option>
                           <option value=".md">MD</option>
                         </select>
+                        {/* 自动补全元数据 */}
+                        <button
+                          type="button"
+                          onClick={() => void runMetadataEnrichment(selectedDocuments.length > 0 ? selectedDocuments : undefined)}
+                          disabled={metadataEnriching}
+                          className="flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:border-brand-400 hover:text-brand-600 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-brand-500"
+                          title="从 PDF、Crossref、OpenAlex 补全作者、年份、来源和 DOI"
+                        >
+                          <Icon icon={metadataEnriching ? 'solar:refresh-bold' : 'solar:magic-stick-3-bold'} className={metadataEnriching ? 'animate-spin' : ''} />
+                          <span className="hidden sm:inline">{metadataEnriching ? '补全中…' : '补全元数据'}</span>
+                        </button>
+                        {/* 视图切换 */}
+                        <div className="flex items-center rounded-lg bg-gray-100 p-0.5 dark:bg-slate-800">
+                          <button
+                            type="button"
+                            onClick={() => setIsGridView(false)}
+                            title="表格视图"
+                            className={`rounded-md p-1.5 transition-colors ${!isGridView ? 'bg-white text-brand-600 shadow-sm dark:bg-slate-700' : 'text-gray-500 hover:text-gray-700 dark:text-slate-400'}`}
+                          >
+                            <Icon icon="solar:list-bold" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setIsGridView(true)}
+                            title="卡片视图"
+                            className={`rounded-md p-1.5 transition-colors ${isGridView ? 'bg-white text-brand-600 shadow-sm dark:bg-slate-700' : 'text-gray-500 hover:text-gray-700 dark:text-slate-400'}`}
+                          >
+                            <Icon icon="solar:widget-4-bold" />
+                          </button>
+                        </div>
                         {/* 操作按钮 */}
                         <div className="flex items-center space-x-2">
                           {selectedDocuments.length > 0 && (
@@ -1744,28 +2087,16 @@ function App() {
                     {/* 拖拽上传区域 */}
                     <div
                       ref={dropZoneRef}
-                      className={`mt-4 mb-4 p-8 border-2 border-dashed rounded-xl transition-all ${isDragging ? 'border-brand-500 bg-brand-50 dark:bg-brand-900/20' : 'border-gray-300 dark:border-slate-700 hover:border-brand-400'}`}
+                      className={`mt-3 mb-3 rounded-xl border-2 border-dashed px-4 py-4 transition-all ${isDragging ? 'border-brand-500 bg-brand-50 dark:bg-brand-900/20' : 'border-gray-300 hover:border-brand-400 dark:border-slate-700'}`}
                       onDragEnter={handleDragEnter}
                       onDragLeave={handleDragLeave}
                       onDragOver={handleDragOver}
                       onDrop={handleDrop}
                     >
-                      <div className="text-center">
-                        <Icon icon="solar:upload-cloud-bold" className="text-4xl text-gray-400 mx-auto mb-3" />
-                        <p className="text-gray-500 mb-2">拖拽文件到此处上传</p>
-                        <p className="text-xs text-gray-400 mb-4">支持 .txt, .md, .pdf, .doc, .docx 格式，单个文件最大20MB</p>
-                        <button
-                          className="px-4 py-2 bg-brand-600 text-white rounded-lg text-sm font-bold flex items-center space-x-1 transition-all hover:shadow-md hover:bg-brand-700 mx-auto"
-                          onClick={() => {
-                            if (fileInputRef.current) {
-                              fileInputRef.current.value = '';
-                              fileInputRef.current.click();
-                            }
-                          }}
-                        >
-                          <Icon icon="solar:upload-bold" />
-                          <span>点击上传</span>
-                        </button>
+                      <div className="flex flex-col items-center justify-center gap-1 text-center sm:flex-row sm:gap-3">
+                        <Icon icon="solar:upload-cloud-bold" className="text-2xl text-gray-400" />
+                        <p className="text-sm text-gray-600 dark:text-slate-300">拖拽文件到此处上传</p>
+                        <p className="text-xs text-gray-400">支持 .txt / .md / .pdf / .doc / .docx，单文件最大 20MB</p>
                       </div>
                     </div>
 
@@ -1791,149 +2122,249 @@ function App() {
                       </div>
                     )}
 
-                    {/* 文件列表 */}
+                    {/* 文献列表 */}
                     <div className="mt-4">
-                      {(() => {
-                        let filteredDocs = documents;
-                        if (filterType === 'recent') {
-                          filteredDocs = recentDocuments;
-                        } else if (filterType === 'favorite') {
-                          filteredDocs = favoriteDocuments;
-                        }
-                        return filteredDocs;
-                      })().length === 0 ? (
-                        <div className="text-center py-8">
-                          <Icon icon={filterType === 'recent' ? 'solar:clock-bold' : filterType === 'favorite' ? 'solar:heart-bold' : 'solar:file-search-bold'} className="text-4xl text-gray-400 mx-auto mb-3" />
+                      {filteredDocuments.length === 0 ? (
+                        <div className="py-10 text-center">
+                          <Icon icon={filterType === 'recent' ? 'solar:clock-bold' : filterType === 'favorite' ? 'solar:heart-bold' : 'solar:file-search-bold'} className="mx-auto mb-3 text-4xl text-gray-400" />
                           <p className="text-gray-500">
                             {filterType === 'recent' ? '最近没有使用过文件' :
-                              filterType === 'favorite' ? '还没有收藏任何文件' :
-                                '该文件夹中没有文件'}
+                              filterType === 'favorite' ? '还没有收藏任何文献' :
+                                statusFilter !== 'all' ? '没有符合当前筛选条件的文献' :
+                                  '该文件夹中没有文献'}
                           </p>
-
                         </div>
-                      ) : (
-                        <div className={isGridView ? 'grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4' : 'space-y-2'}>
-                          {(() => {
-                            let filteredDocs = documents;
-                            if (filterType === 'recent') {
-                              filteredDocs = recentDocuments;
-                            } else if (filterType === 'favorite') {
-                              filteredDocs = favoriteDocuments;
-                            }
-                            return filteredDocs;
-                          })().map((doc) => (
+                      ) : isGridView ? (
+                        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                          {pagedDocuments.map(doc => (
                             <div
                               key={doc.id}
-                              className={`${isGridView ? 'bg-gray-50 dark:bg-slate-800 rounded-xl p-4 border border-gray-200 dark:border-slate-700 hover:shadow-md transition-all cursor-pointer' : 'flex items-center justify-between p-3 bg-gray-50 dark:bg-slate-800 rounded-lg border border-gray-200 dark:border-slate-700 hover:shadow-sm transition-all cursor-pointer'} ${selectedDocuments.includes(doc.id) ? 'ring-2 ring-brand-500' : ''}`}
+                              className={`cursor-pointer rounded-xl border border-gray-200 bg-gray-50 p-4 transition-all hover:shadow-md dark:border-slate-700 dark:bg-slate-800 ${selectedDocuments.includes(doc.id) ? 'ring-2 ring-brand-500' : ''}`}
                               onClick={() => openDocumentInViewer(doc)}
                             >
-                              {isGridView ? (
-                                <div className="flex flex-col space-y-3">
-                                  <div className="flex items-center space-x-3">
-                                    <input
-                                      type="checkbox"
-                                      className="h-4 w-4 accent-blue-600 cursor-pointer"
-                                      checked={selectedDocuments.includes(doc.id)}
-                                      onClick={(e) => e.stopPropagation()}
-                                      onChange={() => toggleDocumentSelection(doc.id)}
-                                      aria-label={`选择文件 ${doc.metadata.filename}`}
-                                    />
-                                    <div className="flex-1 min-w-0">
-                                      <div className="flex items-center justify-between">
-                                        <h5 className="font-medium text-sm truncate" onClick={() => openDocumentInViewer(doc)} style={{ cursor: 'pointer' }}>
-                                          {doc.metadata.filename}
-                                        </h5>
-                                        <button
-                                          className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors"
-                                          onClick={async (e) => {
-                                            e.stopPropagation();
-                                            try {
-                                              await toggleDocumentFavorite(doc.id, !doc.metadata.is_favorite);
-                                              // 重新加载文档列表
-                                              const docs = await getDocuments();
-                                              setDocuments(docs);
-                                              // 更新收藏的文档
-                                              const favDocs = docs.filter(d => d.metadata.is_favorite);
-                                              setFavoriteDocuments(favDocs);
-                                            } catch (error) {
-                                              message.error('更新收藏状态失败');
-                                            }
-                                          }}
-                                        >
-                                          <Icon
-                                            icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'}
-                                            className={doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-400 dark:text-slate-500'}
-                                          />
-                                        </button>
-                                      </div>
-                                      <div className="text-xs text-gray-500 space-y-1">
-                                        <div>{formatFileSize(doc.metadata.size)} • {(doc.metadata.file_type as string) || ''}</div>
-                                        <div>{formatDate(doc.metadata.uploaded_at)}</div>
-                                        <IngestionStatus
-                                          metadata={doc.metadata}
-                                          onRetry={() => retryIngestion(doc.id)}
-                                          onReplace={() => showReplaceDialog(doc.id)}
-                                        />
-                                      </div>
+                              <div className="flex items-start gap-3">
+                                <input
+                                  type="checkbox"
+                                  className="mt-1 h-4 w-4 cursor-pointer accent-blue-600"
+                                  checked={selectedDocuments.includes(doc.id)}
+                                  onClick={event => event.stopPropagation()}
+                                  onChange={() => toggleDocumentSelection(doc.id)}
+                                  aria-label={`选择文献 ${doc.metadata.filename}`}
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0">
+                                      <h5 className="truncate text-sm font-medium">{documentTitle(doc)}</h5>
+                                      <p className="truncate text-xs text-gray-400">{doc.metadata.filename}</p>
                                     </div>
-                                  </div>
-
-                                </div>
-                              ) : (
-                                <div className="flex items-center space-x-3 flex-1 min-w-0">
-                                  <input
-                                    type="checkbox"
-                                    className="h-4 w-4 accent-blue-600 cursor-pointer"
-                                    checked={selectedDocuments.includes(doc.id)}
-                                    onClick={(e) => e.stopPropagation()}
-                                    onChange={() => toggleDocumentSelection(doc.id)}
-                                    aria-label={`选择文件 ${doc.metadata.filename}`}
-                                  />
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center justify-between">
-                                      <h5 className="font-medium text-sm truncate" onClick={() => openDocumentInViewer(doc)} style={{ cursor: 'pointer' }}>
-                                        {doc.metadata.filename}
-                                      </h5>
-                                      <button
-                                        className="p-1 rounded-full hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors"
-                                        onClick={async (e) => {
-                                          e.stopPropagation();
-                                          try {
-                                            await toggleDocumentFavorite(doc.id, !doc.metadata.is_favorite);
-                                            // 重新加载文档列表
-                                            const docs = await getDocuments();
-                                            setDocuments(docs);
-                                            // 更新收藏的文档
-                                            const favDocs = docs.filter(d => d.metadata.is_favorite);
-                                            setFavoriteDocuments(favDocs);
-                                          } catch (error) {
-                                            message.error('更新收藏状态失败');
-                                          }
-                                        }}
-                                      >
-                                        <Icon
-                                          icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'}
-                                          className={doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-400 dark:text-slate-500'}
-                                        />
-                                      </button>
-                                    </div>
-                                    <div className="text-xs text-gray-500 space-y-1">
-                                      <div>{formatFileSize(doc.metadata.size)} • {(doc.metadata.file_type as string) || ''}</div>
-                                      <div>{formatDate(doc.metadata.uploaded_at)}</div>
-                                      <IngestionStatus
-                                        metadata={doc.metadata}
-                                        onRetry={() => retryIngestion(doc.id)}
-                                        onReplace={() => showReplaceDialog(doc.id)}
+                                    <button
+                                      className="rounded-full p-1 transition-colors hover:bg-gray-200 dark:hover:bg-slate-700"
+                                      onClick={event => { event.stopPropagation(); void toggleFavoriteDocument(doc); }}
+                                      title={doc.metadata.is_favorite ? '取消收藏' : '收藏'}
+                                    >
+                                      <Icon
+                                        icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'}
+                                        className={doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-400 dark:text-slate-500'}
                                       />
-                                    </div>
+                                    </button>
                                   </div>
-
+                                  <div className="mt-2 space-y-1 text-xs text-gray-500 dark:text-slate-400">
+                                    <div className="flex flex-wrap gap-x-2 gap-y-1">
+                                      <span className="truncate">{documentAuthors(doc)}</span>
+                                      {documentYear(doc) !== '—' && <span>· {documentYear(doc)}</span>}
+                                      {documentVenue(doc) !== '—' && <span className="truncate">· {documentVenue(doc)}</span>}
+                                    </div>
+                                    <div>{formatFileSize(doc.metadata.size)} · {(doc.metadata.file_type as string) || ''} · {formatDay(doc.metadata.uploaded_at)}</div>
+                                    <IngestionStatus
+                                      metadata={doc.metadata}
+                                      onRetry={() => retryIngestion(doc.id)}
+                                      onReplace={() => showReplaceDialog(doc.id)}
+                                    />
+                                  </div>
                                 </div>
-                              )}
+                              </div>
                             </div>
                           ))}
                         </div>
+                      ) : (
+                        <div className="overflow-x-auto rounded-xl border border-gray-200 dark:border-slate-700">
+                          <table className="w-full min-w-[800px] table-fixed border-collapse text-left text-sm">
+                            <colgroup>
+                              <col style={{ width: '34px' }} />
+                              <col />
+                              <col style={{ width: '84px' }} />
+                              <col style={{ width: '56px' }} />
+                              <col style={{ width: '108px' }} />
+                              <col style={{ width: '96px' }} />
+                              <col style={{ width: '80px' }} />
+                              <col style={{ width: '88px' }} />
+                              <col style={{ width: '84px' }} />
+                            </colgroup>
+                            <thead className="bg-gray-50 text-xs text-gray-500 dark:bg-slate-900/60 dark:text-slate-400">
+                              <tr>
+                                <th className="w-10 px-3 py-2.5">
+                                  <input
+                                    type="checkbox"
+                                    className="h-4 w-4 cursor-pointer accent-blue-600"
+                                    checked={pagedDocuments.length > 0 && pagedDocuments.every(doc => selectedDocuments.includes(doc.id))}
+                                    onChange={toggleSelectAllDocuments}
+                                    aria-label="全选当前页文献"
+                                  />
+                                </th>
+                                <th className="px-3 py-2.5 font-medium">文献</th>
+                                <th className="px-3 py-2.5 font-medium">作者</th>
+                                <th className="w-20 px-3 py-2.5 font-medium">年份</th>
+                                <th className="px-3 py-2.5 font-medium">来源</th>
+                                <th className="px-3 py-2.5 font-medium">专题</th>
+                                <th className="px-3 py-2.5 font-medium">状态</th>
+                                <th className="px-3 py-2.5 font-medium">上传时间</th>
+                                <th className="px-3 py-2.5 text-right font-medium">操作</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100 dark:divide-slate-800">
+                              {pagedDocuments.map(doc => {
+                                const status = doc.metadata.status || '';
+                                const tags = documentTags(doc);
+                                const doi = documentDoi(doc);
+                                const errorMessage = typeof doc.metadata.error_message === 'string' ? doc.metadata.error_message : undefined;
+                                return (
+                                  <tr
+                                    key={doc.id}
+                                    className={`cursor-pointer transition-colors hover:bg-brand-50/50 dark:hover:bg-slate-800/60 ${selectedDocuments.includes(doc.id) ? 'bg-brand-50 dark:bg-brand-900/20' : ''}`}
+                                    onClick={() => openDocumentInViewer(doc)}
+                                  >
+                                    <td className="px-3 py-3" onClick={event => event.stopPropagation()}>
+                                      <input
+                                        type="checkbox"
+                                        className="h-4 w-4 cursor-pointer accent-blue-600"
+                                        checked={selectedDocuments.includes(doc.id)}
+                                        onChange={() => toggleDocumentSelection(doc.id)}
+                                        aria-label={`选择文献 ${doc.metadata.filename}`}
+                                      />
+                                    </td>
+                                    <td className="px-3 py-3">
+                                      <div className="max-w-[320px]">
+                                        <p className="truncate font-medium text-slate-800 dark:text-slate-100" title={documentTitle(doc)}>{documentTitle(doc)}</p>
+                                        <p className="truncate text-xs text-gray-400">{doc.metadata.filename}</p>
+                                        {tags.length > 0 && (
+                                          <div className="mt-1 flex flex-wrap gap-1">
+                                            {tags.slice(0, 3).map(tag => (
+                                              <span key={tag} className="rounded bg-gray-100 px-1.5 py-0.5 text-[11px] text-gray-600 dark:bg-slate-700 dark:text-slate-300">{tag}</span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td className="max-w-[140px] truncate px-3 py-3 text-gray-600 dark:text-slate-300" title={documentAuthors(doc)}>{documentAuthors(doc)}</td>
+                                    <td className="px-3 py-3 text-gray-600 dark:text-slate-300">{documentYear(doc)}</td>
+                                    <td className="px-3 py-3">
+                                      <div className="max-w-[180px]">
+                                        <p className="truncate text-gray-600 dark:text-slate-300" title={documentVenue(doc)}>{documentVenue(doc)}</p>
+                                        {doi && (
+                                          <a
+                                            href={`https://doi.org/${doi}`}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            onClick={event => event.stopPropagation()}
+                                            className="block truncate text-[11px] text-gray-400 hover:text-brand-600"
+                                            title={doi}
+                                          >
+                                            {doi}
+                                          </a>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td className="truncate px-3 py-3 text-gray-600 dark:text-slate-300" title={documentFolder(doc)}>{documentFolder(doc)}</td>
+                                    <td className="px-3 py-3">
+                                      <span
+                                        className={`inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium ${ingestionStyles[status] || 'bg-gray-100 text-gray-600 dark:bg-slate-700 dark:text-slate-300'}`}
+                                        title={errorMessage || ''}
+                                      >
+                                        {ingestionLabels[status] || status || '未知'}
+                                      </span>
+                                    </td>
+                                    <td className="whitespace-nowrap px-3 py-3 text-gray-500 dark:text-slate-400">{formatDay(doc.metadata.uploaded_at)}</td>
+                                    <td className="px-3 py-3" onClick={event => event.stopPropagation()}>
+                                      <div className="flex items-center justify-end gap-1">
+                                        <button
+                                          type="button"
+                                          title={doc.metadata.is_favorite ? '取消收藏' : '收藏'}
+                                          onClick={() => void toggleFavoriteDocument(doc)}
+                                          className={`rounded p-1.5 transition-colors hover:bg-gray-100 dark:hover:bg-slate-700 ${doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-500 hover:text-brand-600'}`}
+                                        >
+                                          <Icon icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'} />
+                                        </button>
+                                        <Dropdown
+                                          trigger={['click']}
+                                          menu={{
+                                            items: [
+                                              { key: 'metadata', label: '编辑元数据' },
+                                              { key: 'enrich', label: '重新识别元数据' },
+                                              ...(status === 'failed' || status === 'no_text_extracted'
+                                                ? [{ key: 'retry', label: '重试入库' }] : []),
+                                              { key: 'replace', label: '替换文件' },
+                                            ],
+                                            onClick: ({ key, domEvent }) => {
+                                              domEvent?.stopPropagation();
+                                              if (key === 'metadata') openMetadataEditor(doc);
+                                              else if (key === 'enrich') void runMetadataEnrichment([doc.id], true);
+                                              else if (key === 'retry') void retryIngestion(doc.id);
+                                              else if (key === 'replace') showReplaceDialog(doc.id);
+                                            },
+                                          }}
+                                        >
+                                          <button
+                                            type="button"
+                                            title="更多操作"
+                                            className="rounded p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-brand-600 dark:hover:bg-slate-700"
+                                          >
+                                            <Icon icon="solar:menu-dots-bold" />
+                                          </button>
+                                        </Dropdown>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
                       )}
+
+                      {/* 分页 */}
+                      <div className="mt-3 flex flex-col gap-2 border-t border-gray-100 pt-3 text-xs text-gray-500 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:text-slate-400">
+                        <span>
+                          共 {filteredDocuments.length} 篇 · 第 {currentDocumentPage}/{totalDocumentPages} 页
+                          {selectedDocuments.length > 0 ? ` · 已选 ${selectedDocuments.length} 篇` : ''}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={documentPageSize}
+                            onChange={event => { setDocumentPageSize(Number(event.target.value)); setDocumentPage(1); }}
+                            className="rounded-lg bg-gray-100 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500 dark:bg-slate-800"
+                          >
+                            <option value={10}>10 条/页</option>
+                            <option value={20}>20 条/页</option>
+                            <option value={50}>50 条/页</option>
+                          </select>
+                          <button
+                            type="button"
+                            disabled={currentDocumentPage <= 1}
+                            onClick={() => setDocumentPage(currentDocumentPage - 1)}
+                            className="rounded-lg bg-gray-100 px-2.5 py-1 transition-colors hover:bg-gray-200 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-slate-800 dark:hover:bg-slate-700"
+                          >
+                            上一页
+                          </button>
+                          <button
+                            type="button"
+                            disabled={currentDocumentPage >= totalDocumentPages}
+                            onClick={() => setDocumentPage(currentDocumentPage + 1)}
+                            className="rounded-lg bg-gray-100 px-2.5 py-1 transition-colors hover:bg-gray-200 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-slate-800 dark:hover:bg-slate-700"
+                          >
+                            下一页
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1992,8 +2423,26 @@ function App() {
             </div>
             <div className="flex items-center space-x-2">
               <button
+                className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+                onClick={() => void undoAnnotation()}
+                disabled={!canUndo}
+                title="撤销上一次标注操作 (Ctrl+Z)"
+              >
+                <Icon icon="solar:undo-left-bold" />
+                <span className="hidden sm:inline">撤销</span>
+              </button>
+              <button
+                className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+                onClick={() => setIsDirectoryCollapsed(value => !value)}
+                title={isDirectoryCollapsed ? '展开文档目录' : '收起文档目录'}
+              >
+                <Icon icon={isDirectoryCollapsed ? 'solar:alt-arrow-right-bold' : 'solar:alt-arrow-left-bold'} />
+                <span className="hidden sm:inline">{isDirectoryCollapsed ? '展开目录' : '收起目录'}</span>
+              </button>
+              <button
                 className="px-3 py-1.5 bg-brand-600 text-white rounded-lg text-xs font-bold flex items-center space-x-1 transition-all hover:shadow-md hover:bg-brand-700"
                 onClick={() => {
+                  setViewerPanel('summary');
                   generateSummary();
                 }}
                 title="智能总结"
@@ -2007,21 +2456,33 @@ function App() {
           {/* 主内容区域 */}
           <div className="flex-1 flex overflow-hidden">
             {/* 左侧目录导航 */}
-            <div className="w-64 border-r border-gray-200 dark:border-slate-800 bg-gray-50 dark:bg-slate-900 overflow-y-auto">
-              <div className="p-4 border-b border-gray-200 dark:border-slate-800">
-                <h5 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">文档目录</h5>
-              </div>
+            {!isDirectoryCollapsed && (
+              <div className="w-64 border-r border-gray-200 dark:border-slate-800 bg-gray-50 dark:bg-slate-900 overflow-y-auto">
+                <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-slate-800">
+                  <h5 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">文档目录</h5>
+                  <button
+                    className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-200 hover:text-gray-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                    onClick={() => setIsDirectoryCollapsed(true)}
+                    title="收起文档目录"
+                  >
+                    <Icon icon="solar:alt-arrow-left-bold" />
+                  </button>
+                </div>
               <div className="p-2">
                 {documentView?.view_type === 'pdf' ? (
                   pdfNavigation ? (
-                    <nav className="space-y-1" aria-label={pdfNavigation.bookmarks.length ? 'PDF 章节目录' : 'PDF 页码导航'}>
-                      {!pdfNavigation.bookmarks.length && <p className="px-3 py-2 text-xs text-gray-500">PDF 没有可用书签，按页码浏览。</p>}
+                    <nav className="space-y-1" aria-label={hasOutline ? 'PDF 章节目录' : 'PDF 页码导航'}>
+                      {!hasOutline && <p className="px-3 py-2 text-xs text-gray-500">未识别到章节标题，按页码浏览。</p>}
                       {pdfDirectory.map((item, index) => (
                         <button key={index} type="button"
-                          className="block w-full break-words rounded-lg px-3 py-2 text-left text-sm hover:bg-gray-200 dark:hover:bg-slate-800"
+                          className="w-full break-words rounded-lg px-3 py-2 text-left text-sm leading-5 line-clamp-2 hover:bg-gray-200 dark:hover:bg-slate-800"
                           style={{ paddingLeft: Math.min(item.level, 5) * 12 + 12 }}
-                          title={`跳到第 ${item.pageIndex + 1} 页`}
-                          onClick={() => setPdfPageJump(pdfNavigation.bookmarks.length ? { ...item } : { pageIndex: item.pageIndex })}>
+                          title={`${item.title} · 跳到第 ${item.pageIndex + 1} 页`}
+                          onClick={() => setPdfPageJump({
+                            pageIndex: item.pageIndex,
+                            title: item.title,
+                            destination: 'destination' in item ? item.destination : undefined,
+                          })}>
                           {item.title}
                         </button>
                       ))}
@@ -2053,7 +2514,21 @@ function App() {
                   </div>
                 )}
               </div>
-            </div>
+              </div>
+            )}
+
+            {isDirectoryCollapsed && (
+              <div className="flex w-9 shrink-0 flex-col items-center border-r border-gray-200 bg-gray-50 py-3 dark:border-slate-800 dark:bg-slate-900">
+                <button
+                  className="rounded p-1.5 text-gray-500 transition-colors hover:bg-gray-200 hover:text-brand-600 dark:hover:bg-slate-800"
+                  onClick={() => setIsDirectoryCollapsed(false)}
+                  title="展开文档目录"
+                >
+                  <Icon icon="solar:alt-arrow-right-bold" />
+                </button>
+                <span className="mt-3 text-[10px] tracking-[0.3em] text-gray-400 [writing-mode:vertical-rl]">目录</span>
+              </div>
+            )}
 
             {/* 中间文档内容 */}
             <div className="min-w-0 flex-1 overflow-auto">
@@ -2079,9 +2554,23 @@ function App() {
                     {documentView?.view_type === 'pdf' && selectedDocument && (
                       <div className="h-full p-3">
                         <React.Suspense fallback={<p role="status">正在加载 PDF 阅读器…</p>}>
-                          <PdfReferencePreview key={selectedDocument.id} url={getDocumentFileUrl(selectedDocument.id)}
+                          <PdfReferencePreview key={selectedDocument.id}
+                            url={getDocumentFileUrl(selectedDocument.id, activePdfVersionId)}
                             sources={noPdfSources} onError={handlePdfPreviewError}
-                            onNavigation={setPdfNavigation} pageJump={pdfPageJump} />
+                            onNavigation={setPdfNavigation} pageJump={pdfPageJump}
+                            annotations={visibleAnnotations}
+                            onCreateAnnotation={activePdfVersionId ? async draft => {
+                              if (!activePdfVersionId) return;
+                              const versionId = activePdfVersionId;
+                              try {
+                                const created = await createDocumentAnnotation(selectedDocument.id, versionId, draft);
+                                setAnnotations(previous => [...previous, created]);
+                                pushAnnotationHistory({ type: 'create', id: created.id });
+                              } catch (error) {
+                                message.error(error instanceof Error ? error.message : '保存标注失败。');
+                                throw error;
+                              }
+                            } : undefined} />
                         </React.Suspense>
                       </div>
                     )}
@@ -2181,12 +2670,65 @@ function App() {
             />
             <div style={{ '--summary-width': summaryWidth + '%' } as React.CSSProperties}
               className="w-64 overflow-y-auto border-l border-gray-200 bg-gray-50 dark:border-slate-800 dark:bg-slate-900 lg:w-[var(--summary-width)] lg:shrink-0">
-              <div className="p-4 border-b border-gray-200 dark:border-slate-800">
-                <h5 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">智能总结</h5>
+              <div className="border-b border-gray-200 p-3 dark:border-slate-800">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setViewerPanel('summary')}
+                    className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${viewerPanel === 'summary'
+                      ? 'bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
+                      : 'text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                  >
+                    智能总结
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewerPanel('annotations')}
+                    className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${viewerPanel === 'annotations'
+                      ? 'bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
+                      : 'text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                  >
+                    标注{visibleAnnotations.length > 0 ? ` (${visibleAnnotations.length})` : ''}
+                  </button>
+                </div>
                 {pdfNavigation && <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">PDF 原文 · 共 {pdfNavigation.totalPages} 页</p>}
               </div>
               <div className="p-4">
-                {summaryLoading ? (
+                {viewerPanel === 'annotations' ? (
+                  visibleAnnotations.length === 0 ? (
+                    <p className="text-sm text-gray-500">还没有标注。选中文字后使用高亮或下划线。</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {visibleAnnotations.map(annotation => (
+                        <div key={annotation.id} data-annotation-id={annotation.id} className="rounded-lg border border-gray-200 bg-white p-3 text-xs dark:border-slate-700 dark:bg-slate-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setPdfPageJump({ pageIndex: annotation.page_index })}
+                              className="font-medium text-brand-600 hover:underline"
+                            >
+                              {annotation.kind === 'highlight' ? '高亮' : '下划线'} · 第 {annotation.page_index + 1} 页
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void removeAnnotation(annotation.id)}
+                              title="删除标注"
+                              className="rounded p-1 text-red-500 transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/20"
+                            >
+                              <Icon icon="solar:trash-bin-trash-bold" />
+                            </button>
+                          </div>
+                          {annotation.quote && (
+                            <p className="mt-1 line-clamp-3 text-gray-500 dark:text-slate-400" title={annotation.quote}>“{annotation.quote}”</p>
+                          )}
+                          {annotation.note && (
+                            <p className="mt-1 whitespace-pre-wrap text-gray-700 dark:text-slate-300">{annotation.note}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )
+                ) : summaryLoading ? (
                   <div className="flex items-center justify-center py-8">
                     <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-brand-600 mr-2"></div>
                     <span className="text-sm text-gray-500">生成中...</span>
@@ -2425,6 +2967,64 @@ function App() {
           <Select.Option value="shared">共享</Select.Option>
           <Select.Option value="public">公开</Select.Option>
         </Select>
+      </Modal>
+
+      {/* 编辑文献元数据对话框 */}
+      <Modal
+        title="编辑文献元数据"
+        open={isMetadataModalOpen}
+        onOk={() => void handleMetadataSubmit()}
+        confirmLoading={metadataSaving}
+        onCancel={() => setIsMetadataModalOpen(false)}
+        okText="保存"
+        cancelText="取消"
+      >
+        <div className="space-y-3">
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">标题</span>
+            <Input
+              value={metadataForm.title}
+              onChange={event => setMetadataForm(form => ({ ...form, title: event.target.value }))}
+              placeholder="文献标题"
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">作者</span>
+            <Input
+              value={metadataForm.authors}
+              onChange={event => setMetadataForm(form => ({ ...form, authors: event.target.value }))}
+              placeholder="张三、李四"
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="mb-1 block text-xs text-gray-500">出版年份</span>
+              <Input
+                value={metadataForm.year}
+                inputMode="numeric"
+                onChange={event => setMetadataForm(form => ({ ...form, year: event.target.value }))}
+                placeholder="2024"
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-gray-500">期刊 / 会议</span>
+              <Input
+                value={metadataForm.venue}
+                onChange={event => setMetadataForm(form => ({ ...form, venue: event.target.value }))}
+                placeholder="Nature"
+              />
+            </label>
+          </div>
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">DOI</span>
+            <Input
+              value={metadataForm.doi}
+              onChange={event => setMetadataForm(form => ({ ...form, doi: event.target.value }))}
+              placeholder="10.1000/xxxxx"
+            />
+          </label>
+        </div>
+        <p className="mt-3 text-xs text-gray-400">作者可用顿号、逗号或分号分隔。保存后标记为手动编辑，自动补全不会覆盖这些字段。</p>
       </Modal>
 
 

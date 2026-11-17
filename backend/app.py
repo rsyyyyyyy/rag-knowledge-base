@@ -8,7 +8,7 @@ import os
 import json
 import asyncio
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import lru_cache
 from fastembed import TextEmbedding
@@ -20,6 +20,11 @@ from urllib.parse import quote
 import PyPDF2
 from docx import Document
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
+from threading import RLock, Thread
+from typing import Literal
+import math
+import time
 from catalog import Catalog
 from chat_history import ChatHistory
 from conversation_state import (
@@ -42,6 +47,9 @@ from question_router import plan_question
 from document_reading import prepare_full_context
 from evidence_grounding import quote_span, ground_answer
 from online_papers import public_link, router as online_papers_router
+from metadata_enrichment import build_metadata_updates, normalize_doi
+from outline import outline_for_document
+from annotations import AnnotationStore
 
 DEEPSEEK_MODEL = "deepseek-flash"
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -84,10 +92,47 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("RAG_DATA_DIR", str(BASE_DIR / "data"))).resolve()
 UPLOADS_DIR = DATA_DIR / "uploads"
-CHROMA_DIR = DATA_DIR / "chroma_db"
+
+
+def _resolve_chroma_dir(data_dir: Path) -> Path:
+    """Chroma 1.x cannot reload its HNSW index from a non-ASCII Windows path.
+
+    Keep SQLite and uploads under the project data directory, but move the
+    vector store to an ASCII path on the same drive. `RAG_CHROMA_DIR` overrides it.
+    """
+    override = os.getenv("RAG_CHROMA_DIR", "").strip()
+    if override:
+        return Path(override).resolve()
+    candidate = data_dir / "chroma_db"
+    if str(candidate).isascii():
+        return candidate
+    digest = hashlib.sha1(str(data_dir).encode("utf-8")).hexdigest()[:10]
+    candidates = []
+    if data_dir.anchor:
+        candidates.append(Path(data_dir.anchor))
+    if os.name == "nt":
+        candidates.append(Path(os.getenv("PUBLIC", r"C:\Users\Public")))
+    candidates.append(Path.home())
+    for base in candidates:
+        if not str(base).isascii():
+            continue
+        target = base / f"rag-kb-chroma-{digest}"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        print(f"[ChromaDB] Non-ASCII data path; using vector store at {target}")
+        return target
+    raise RuntimeError(
+        "ChromaDB needs an ASCII directory. Set RAG_CHROMA_DIR to a writable ASCII path."
+    )
+
+
+CHROMA_DIR = _resolve_chroma_dir(DATA_DIR)
 catalog = Catalog(DATA_DIR)
 chat_history = ChatHistory(catalog)
 ingest_store = IngestStore(catalog)
+annotation_store = AnnotationStore(catalog)
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".pdf", ".doc", ".docx"}
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
@@ -125,7 +170,14 @@ def _init_chromadb():
         )
         print(f"[ChromaDB] Collection '{COLLECTION_NAME}' loaded, {collection.count()} chunks")
     except Exception as error:
-        print(f"[ChromaDB] Rebuilding collection '{COLLECTION_NAME}': {error}")
+        # Never delete the collection implicitly. Another backend process holding
+        # the same Chroma directory produces exactly this load error, and vectors
+        # are recoverable from SQLite; destroying them here causes silent data loss.
+        print(f"[ChromaDB] Could not open collection '{COLLECTION_NAME}': {error}")
+        print("[ChromaDB] Stop other backend processes using this data directory and retry.")
+        if os.getenv("RAG_REBUILD_CHROMA") != "1":
+            raise
+        print("[ChromaDB] RAG_REBUILD_CHROMA=1: rebuilding the collection explicitly.")
         client.delete_collection(COLLECTION_NAME)
         collection = client.get_or_create_collection(
             name=COLLECTION_NAME, embedding_function=local_embedding,
@@ -295,6 +347,35 @@ class QueryRequest(KnowledgeScope):
     attachment_basis: str | None = Field(default=None, pattern=r"^(pdf|abstract)$")
 
 
+class AnnotationCreate(BaseModel):
+    version_id: str = Field(min_length=8, max_length=128)
+    page_index: int = Field(ge=0, le=100000)
+    kind: Literal["highlight", "underline"]
+    color: str = Field(default="#facc15", pattern=r"^#[0-9a-fA-F]{6}$")
+    rects: list[list[float]] = Field(min_length=1, max_length=100)
+    quote: str = Field(default="", max_length=2000)
+    note: str = Field(default="", max_length=5000)
+
+    @field_validator("rects")
+    @classmethod
+    def validate_rects(cls, value):
+        for rect in value:
+            if len(rect) != 4:
+                raise ValueError("每个标注矩形需要 4 个坐标")
+            if not all(math.isfinite(item) for item in rect):
+                raise ValueError("标注坐标必须是有限数值")
+            x0, y0, x1, y1 = rect
+            if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+                raise ValueError("标注坐标必须位于页面内，且左上小于右下")
+        return value
+
+
+class AnnotationUpdate(BaseModel):
+    note: str | None = Field(default=None, max_length=5000)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    kind: Literal["highlight", "underline"] | None = None
+
+
 def _parse_document_text(path: Path) -> str:
     extension = path.suffix.lower()
     if extension == ".pdf":
@@ -311,7 +392,10 @@ knowledge_search = KnowledgeSearchService(ingestion)
 @app.on_event("startup")
 def on_startup() -> None:
     ensure_storage_ready()
+    annotation_store.initialize()
     ingestion.start(load_documents_meta(), _resolve_legacy_path)
+    if AUTO_METADATA_ENRICHMENT:
+        Thread(target=_backfill_metadata, name="metadata-backfill", daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -338,6 +422,92 @@ def _resolve_doc_path(doc: dict, version_id: str | None = None) -> Path | None:
     if version_id is not None:
         return None
     return _resolve_legacy_path(doc)
+
+
+metadata_lock = RLock()
+AUTO_METADATA_ENRICHMENT = os.getenv("RAG_AUTO_METADATA", "1") != "0"
+
+
+def _metadata_present(value) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict)):
+        return bool(value)
+    return value is not None
+
+
+def metadata_needs_enrichment(metadata: dict, force: bool = False) -> bool:
+    if metadata.get("metadata_source") == "manual" and force:
+        return False
+    if force:
+        return True
+    checked = metadata.get("metadata_checked_at")
+    if checked:
+        try:
+            when = datetime.fromisoformat(str(checked).replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - when < timedelta(days=7):
+                return False
+        except ValueError:
+            pass
+    return (
+        not _metadata_present(metadata.get("year"))
+        or not _metadata_present(metadata.get("venue"))
+        or not _metadata_present(metadata.get("doi"))
+        or not (_metadata_present(metadata.get("authors")) or _metadata_present(metadata.get("author")))
+    )
+
+
+def _enrich_document_metadata(doc_id: str, force: bool = False) -> dict | None:
+    doc = next((item for item in load_documents_meta() if item.get("id") == doc_id), None)
+    if not doc:
+        return None
+    metadata = doc.get("metadata", {})
+    if metadata.get("metadata_source") == "manual" and force:
+        return doc
+    path = _resolve_doc_path(doc)
+    updates = build_metadata_updates(metadata, path, overwrite=force)
+    with metadata_lock:
+        docs = load_documents_meta()
+        target = next((item for item in docs if item.get("id") == doc_id), None)
+        if not target:
+            return None
+        merged = dict(target.get("metadata", {}))
+        manual = merged.get("metadata_source") == "manual"
+        for key, value in updates.items():
+            if force or not _metadata_present(merged.get(key)):
+                merged[key] = value
+        if manual:
+            # Keep the manual marker so later automatic runs stay field-safe.
+            merged["metadata_source"] = "manual"
+        target["metadata"] = merged
+        save_documents_meta(docs)
+        return target
+
+
+def _run_metadata_enrichment(doc_id: str, force: bool = False) -> None:
+    try:
+        _enrich_document_metadata(doc_id, force)
+    except Exception as error:
+        print(f"[metadata] enrichment failed for {doc_id}: {type(error).__name__}: {error}")
+
+
+def _start_metadata_enrichment(doc_id: str, force: bool = False) -> None:
+    if not AUTO_METADATA_ENRICHMENT and not force:
+        return
+    Thread(target=_run_metadata_enrichment, args=(doc_id, force), daemon=True).start()
+
+
+def _backfill_metadata() -> None:
+    try:
+        pending = [
+            doc for doc in load_documents_meta()
+            if metadata_needs_enrichment(doc.get("metadata", {}))
+        ][:20]
+    except Exception:
+        return
+    for doc in pending:
+        _run_metadata_enrichment(doc["id"])
+        time.sleep(0.3)
 
 
 def document_status(doc: dict, snapshot=None) -> dict:
@@ -367,6 +537,14 @@ def _get_document(doc_id: str) -> dict:
     if not target:
         raise HTTPException(status_code=404, detail="Document not found")
     return target
+
+
+def _verified_pdf_version(doc_id: str, version_id: str) -> dict:
+    doc = _get_document(doc_id)
+    path = _resolve_doc_path(doc, version_id)
+    if not path or path.suffix.lower() != ".pdf" or pdf_version(path) != version_id:
+        raise HTTPException(status_code=404, detail="PDF 版本不存在或已更新，请重新打开文献。")
+    return doc
 
 
 async def _read_upload(file: UploadFile):
@@ -482,6 +660,7 @@ async def upload_document(file: UploadFile = File(...), folder_id: str | None = 
     }
     ingest_store.enqueue(doc, version, stored_path, new=True)
     ingestion.wake.set()
+    _start_metadata_enrichment(doc["id"])
     return {
         "message": "Document queued", "document_id": doc["id"],
         "document": document_status(doc), "duplicate": False,
@@ -501,6 +680,7 @@ async def replace_document(doc_id: str, file: UploadFile = File(...)):
     version, stored_path = ingestion.save_original(UPLOADS_DIR, content, extension)
     ingest_store.enqueue(doc, version, stored_path)
     ingestion.wake.set()
+    _start_metadata_enrichment(doc_id)
     return {"message": "Document version queued", "document": document_status(doc)}
 
 
@@ -708,6 +888,7 @@ def get_document_view(doc_id: str, include_pdf_text: bool = True):
             "file_type": ext,
             "view_type": "pdf",
             "url": f"/api/documents/{doc_id}/file",
+            "version_id": pdf_version(file_path),
         }
         if include_pdf_text:
             pdf_text = read_pdf_text(file_path)
@@ -735,6 +916,54 @@ def get_document_view(doc_id: str, include_pdf_text: bool = True):
         "message": "当前文件类型暂不支持页面内预览。",
         "directory": []
     }
+
+
+@app.get("/api/documents/{doc_id}/outline")
+def get_document_outline(doc_id: str):
+    target = _get_document(doc_id)
+    metadata = target.get("metadata", {})
+    title = metadata.get("title") or metadata.get("filename") or ""
+    try:
+        return {"outline": outline_for_document(catalog, doc_id, title)}
+    except Exception as error:
+        print(f"[outline] {type(error).__name__}: {error}")
+        return {"outline": []}
+
+
+@app.get("/api/documents/{doc_id}/annotations")
+def list_document_annotations(
+    doc_id: str, version_id: str = Query(..., min_length=8, max_length=128),
+):
+    _verified_pdf_version(doc_id, version_id)
+    return {"annotations": annotation_store.list(doc_id, version_id)}
+
+
+@app.post("/api/documents/{doc_id}/annotations", status_code=201)
+def create_document_annotation(doc_id: str, request: AnnotationCreate):
+    _verified_pdf_version(doc_id, request.version_id)
+    return annotation_store.create(
+        doc_id, request.version_id, request.page_index, request.kind,
+        request.color, request.rects, request.quote, request.note,
+    )
+
+
+@app.patch("/api/documents/{doc_id}/annotations/{annotation_id}")
+def update_document_annotation(doc_id: str, annotation_id: str, request: AnnotationUpdate):
+    _get_document(doc_id)
+    annotation = annotation_store.update(
+        doc_id, annotation_id, note=request.note, color=request.color, kind=request.kind,
+    )
+    if not annotation:
+        raise HTTPException(status_code=404, detail="标注不存在")
+    return annotation
+
+
+@app.delete("/api/documents/{doc_id}/annotations/{annotation_id}", status_code=204)
+def delete_document_annotation(doc_id: str, annotation_id: str):
+    _get_document(doc_id)
+    if not annotation_store.delete(doc_id, annotation_id):
+        raise HTTPException(status_code=404, detail="标注不存在")
+    return Response(status_code=204)
 
 
 @app.post("/api/retrieve")
@@ -1790,7 +2019,22 @@ async def search_documents(
         filtered_docs = docs
         
         if query:
-            filtered_docs = [doc for doc in filtered_docs if query.lower() in doc.get("metadata", {}).get("filename", "").lower()]
+            needle = query.lower()
+
+            def matches_query(doc):
+                metadata = doc.get("metadata", {})
+                values = [
+                    metadata.get("filename"), metadata.get("title"), metadata.get("author"),
+                    metadata.get("venue"), metadata.get("journal"), metadata.get("doi"),
+                    metadata.get("source"),
+                ]
+                for key in ("authors", "tags"):
+                    value = metadata.get(key)
+                    if isinstance(value, list):
+                        values.extend(value)
+                return any(isinstance(value, str) and needle in value.lower() for value in values)
+
+            filtered_docs = [doc for doc in filtered_docs if matches_query(doc)]
         
         if folder_id is not None:
             # 如果是默认文件夹，也显示folder_id为null的文件
@@ -1809,6 +2053,11 @@ async def search_documents(
             filtered_docs.sort(key=lambda x: x.get("metadata", {}).get("filename", ""), reverse=(sort_order == "desc"))
         elif sort_by == "size":
             filtered_docs.sort(key=lambda x: x.get("metadata", {}).get("size", 0), reverse=(sort_order == "desc"))
+        elif sort_by == "year":
+            filtered_docs.sort(
+                key=lambda x: str(x.get("metadata", {}).get("year") or ""),
+                reverse=(sort_order == "desc"),
+            )
         
         return {"documents": document_statuses(filtered_docs)}
     except Exception as e:
@@ -1829,6 +2078,9 @@ async def update_document_metadata(
     doc_id: str, tags: str = Query(None, description="Comma-separated tags"), source: str = Query(None, description="Source"), project: str = Query(None, description="Project"), author: str = Query(None, description="Author"),
     title: str | None = Query(None, max_length=512),
     doi: str | None = Query(None, max_length=256),
+    year: int | None = Query(None, ge=1000, le=3000),
+    venue: str | None = Query(None, max_length=512),
+    authors: str | None = Query(None, max_length=2000),
 ):
     try:
         docs = load_documents_meta()
@@ -1845,14 +2097,68 @@ async def update_document_metadata(
             target["metadata"]["project"] = project
         if author is not None:
             target["metadata"]["author"] = author
+            target["metadata"]["authors"] = [part.strip() for part in re.split(r"[;；,，、]", author) if part.strip()]
+        if authors is not None:
+            author_list = [part.strip() for part in re.split(r"[;；,，、]", authors) if part.strip()]
+            target["metadata"]["authors"] = author_list
+            target["metadata"]["author"] = "、".join(author_list)
 
         if title is not None:
             target["metadata"]["title"] = title.strip()
         if doi is not None:
-            target["metadata"]["doi"] = doi.strip()
+            target["metadata"]["doi"] = normalize_doi(doi) or doi.strip()
+        if year is not None:
+            target["metadata"]["year"] = year
+        if venue is not None:
+            target["metadata"]["venue"] = venue.strip()
+        target["metadata"]["metadata_source"] = "manual"
+        target["metadata"]["metadata_updated_at"] = datetime.utcnow().isoformat() + "Z"
 
         save_documents_meta(docs)
         return {"message": "Document metadata updated successfully", "document": target}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 自动补全文献元数据（PDF、Crossref、OpenAlex）
+@app.post("/api/documents/enrich-metadata")
+def enrich_documents_metadata(
+    doc_ids: str | None = Query(None, description="Comma-separated document IDs; empty means all pending"),
+    force: bool = Query(False, description="Overwrite existing fields and retry checked documents"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    try:
+        selected = {value for value in (doc_ids or "").split(",") if value}
+        docs = load_documents_meta()
+        candidates = [
+            doc for doc in docs
+            if (not selected or doc["id"] in selected)
+            and metadata_needs_enrichment(doc.get("metadata", {}), force)
+        ]
+        batch = candidates[:limit]
+        remaining = max(0, len(candidates) - len(batch))
+        updated, failed = [], []
+        if batch:
+            with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
+                futures = {
+                    executor.submit(_enrich_document_metadata, doc["id"], force): doc["id"]
+                    for doc in batch
+                }
+                for future, doc_id in futures.items():
+                    try:
+                        result = future.result()
+                        if result:
+                            updated.append(document_status(result))
+                        else:
+                            failed.append(doc_id)
+                    except Exception:
+                        failed.append(doc_id)
+        return {
+            "updated": updated, "failed": failed, "remaining": remaining,
+            "message": f"已补全 {len(updated)} 篇文献的元数据。",
+        }
     except HTTPException:
         raise
     except Exception as e:

@@ -1,7 +1,12 @@
-import { getDocument, GlobalWorkerOptions, type PDFPageProxy, type PDFDocumentProxy } from 'pdfjs-dist';
+import {
+  getDocument, GlobalWorkerOptions, TextLayer,
+  type PDFPageProxy, type PDFDocumentProxy,
+} from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { Source } from '../services/api';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type {
+  AnnotationDraft, AnnotationKind, PdfAnnotation, Source,
+} from '../services/api';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -87,12 +92,41 @@ interface PdfReferencePreviewProps {
   onNavigation?: (navigation: PdfNavigation) => void;
   pageJump?: PdfPageJump | null;
   selectionId?: number;
+  annotations?: PdfAnnotation[];
+  onCreateAnnotation?: (draft: AnnotationDraft) => Promise<void>;
 }
 
 type PageRect = NonNullable<Source['rects']>[number];
 const emptyRects: PageRect[] = [];
 
-function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects }: {
+interface AnnotationSelection {
+  pageIndex: number;
+  rects: [number, number, number, number][];
+  quote: string;
+}
+
+function selectionRects(range: Range, pageRect: DOMRect): [number, number, number, number][] {
+  const rects: [number, number, number, number][] = [];
+  for (const clientRect of Array.from(range.getClientRects())) {
+    if (clientRect.width < 1 || clientRect.height < 1) continue;
+    const centerX = clientRect.left + clientRect.width / 2;
+    const centerY = clientRect.top + clientRect.height / 2;
+    if (centerX < pageRect.left || centerX > pageRect.right
+      || centerY < pageRect.top || centerY > pageRect.bottom) continue;
+    const x0 = Math.max(0, (clientRect.left - pageRect.left) / pageRect.width);
+    const y0 = Math.max(0, (clientRect.top - pageRect.top) / pageRect.height);
+    const x1 = Math.min(1, (clientRect.right - pageRect.left) / pageRect.width);
+    const y1 = Math.min(1, (clientRect.bottom - pageRect.top) / pageRect.height);
+    if (x1 - x0 < 0.002 || y1 - y0 < 0.002) continue;
+    rects.push([x0, y0, x1, y1]);
+  }
+  return rects;
+}
+
+function PdfPage({
+  page, pageNumber, ratio, requestPage, scroller, width, rects,
+  annotations, annotationMode, onSelect,
+}: {
   page?: PDFPageProxy;
   pageNumber: number;
   ratio: number;
@@ -100,13 +134,30 @@ function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects 
   scroller: HTMLDivElement | null;
   width: number;
   rects: PageRect[];
+  annotations: PdfAnnotation[];
+  annotationMode: AnnotationKind | null;
+  onSelect?: (selection: AnnotationSelection) => void;
 }) {
   const frame = useRef<HTMLDivElement>(null);
   const surface = useRef<HTMLDivElement>(null);
+  const textLayer = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [failed, setFailed] = useState(false);
   const natural = page?.getViewport({ scale: 1 });
   const naturalWidth = natural?.width;
+
+  const finishTextSelection = () => {
+    if (!annotationMode || !onSelect || !frame.current) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const pageRect = frame.current.getBoundingClientRect();
+    if (!pageRect.width || !pageRect.height) return;
+    const rects = selectionRects(selection.getRangeAt(0), pageRect);
+    if (!rects.length) return;
+    const quote = selection.toString().trim().replace(/\s+/g, ' ').slice(0, 2000);
+    selection.removeAllRanges();
+    onSelect({ pageIndex: pageNumber - 1, rects, quote });
+  };
 
   useEffect(() => {
     const element = frame.current;
@@ -133,6 +184,7 @@ function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects 
     if (!host) return;
     if (!nearViewport || !page || !naturalWidth) {
       host.replaceChildren();
+      textLayer.current?.replaceChildren();
       return;
     }
     const viewport = page.getViewport({ scale: width / naturalWidth });
@@ -146,6 +198,8 @@ function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects 
     let active = true;
     // Avoid starting a new canvas render for each pointer event during drag or wheel zoom.
     let render: ReturnType<PDFPageProxy['render']> | undefined;
+    let textTask: TextLayer | undefined;
+    const layer = textLayer.current;
     const timer = window.setTimeout(() => {
       render = page.render({ canvas, viewport, transform: [ratio, 0, 0, ratio, 0, 0] });
       void render.promise.then(() => {
@@ -155,19 +209,33 @@ function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects 
       }).catch(() => {
         if (active) setFailed(true);
       });
+      if (layer) {
+        layer.replaceChildren();
+        layer.style.setProperty('--total-scale-factor', String(viewport.scale));
+        layer.style.setProperty('--scale-round-x', '1px');
+        layer.style.setProperty('--scale-round-y', '1px');
+        void page.getTextContent().then(content => {
+          if (!active || !layer) return;
+          textTask = new TextLayer({ textContentSource: content, container: layer, viewport });
+          return textTask.render();
+        }).catch(() => {});
+      }
     }, 80);
     return () => {
       active = false;
       window.clearTimeout(timer);
       render?.cancel();
+      textTask?.cancel();
     };
   }, [nearViewport, naturalWidth, page, width]);
 
   return (
     <div ref={frame} data-pdf-page={pageNumber} aria-label={`PDF 第 ${pageNumber} 页`}
       role="group" className="relative mx-auto bg-white shadow-sm"
-      style={{ width, aspectRatio: natural ? natural.width / natural.height : ratio }}>
+      style={{ width, aspectRatio: natural ? natural.width / natural.height : ratio }}
+      onMouseUp={finishTextSelection}>
       <div ref={surface} className="absolute inset-0" />
+      <div ref={textLayer} className="textLayer" />
       {failed && <p role="status" className="p-3 text-slate-900">这一页暂时无法渲染。</p>}
       {rects.length > 0 && (
         <div className="pointer-events-none absolute inset-0" aria-label="原文证据高亮">
@@ -179,11 +247,37 @@ function PdfPage({ page, pageNumber, ratio, requestPage, scroller, width, rects 
           ))}
         </div>
       )}
+      {annotations.map(annotation => (
+        <Fragment key={annotation.id}>
+          {annotation.rects.map((rect, index) => {
+            const [x0, y0, x1, y1] = rect;
+            const box = {
+              left: `${x0 * 100}%`, top: `${y0 * 100}%`,
+              width: `${(x1 - x0) * 100}%`, height: `${(y1 - y0) * 100}%`,
+            };
+            const style = annotation.kind === 'underline'
+              ? { ...box, borderBottom: `3px solid ${annotation.color}` }
+              : { ...box, backgroundColor: annotation.color, opacity: 0.35 };
+            return (
+              <div
+                key={index}
+                data-annotation-id={annotation.id}
+                className={`pointer-events-none absolute ${annotation.kind === 'underline' ? '' : 'rounded-sm'}`}
+                style={style}
+              />
+            );
+          })}
+        </Fragment>
+      ))}
     </div>
   );
 }
 
-export default function PdfReferencePreview({ url, sources, onError, onNavigation, pageJump, selectionId }: PdfReferencePreviewProps) {
+export default function PdfReferencePreview({
+  url, sources, onError, onNavigation, pageJump, selectionId,
+  annotations = [], onCreateAnnotation,
+}: PdfReferencePreviewProps) {
+  const [annotationMode, setAnnotationMode] = useState<AnnotationKind | null>(null);
   const [preview, setPreview] = useState<{ pdf: PDFDocumentProxy; initialPage: PDFPageProxy } | null>(null);
   const [pages, setPages] = useState(new Map<number, PDFPageProxy>());
   const preferredPage = useRef(Math.min(...sources.map(source => (source.page_index ?? Infinity) + 1)));
@@ -207,6 +301,50 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
     rects.push(...(source.rects ?? []));
     highlights.set(index, rects);
   }
+  const annotationsByPage = new Map<number, PdfAnnotation[]>();
+  for (const annotation of annotations) {
+    if (annotation.kind === 'note') continue;
+    const current = annotationsByPage.get(annotation.page_index) ?? [];
+    current.push(annotation);
+    annotationsByPage.set(annotation.page_index, current);
+  }
+  const createFromSelection = async (kind: AnnotationKind, { pageIndex, rects, quote }: AnnotationSelection) => {
+    if (!onCreateAnnotation) return;
+    try {
+      await onCreateAnnotation({
+        page_index: pageIndex,
+        kind,
+        color: kind === 'highlight' ? '#facc15' : '#2563eb',
+        rects,
+        quote,
+        note: '',
+      });
+    } catch {
+      // The parent shows the error message.
+    }
+  };
+  const handleSelection = (selection: AnnotationSelection) => {
+    if (!annotationMode) return;
+    void createFromSelection(annotationMode, selection);
+  };
+  const applyCurrentSelection = (kind: AnnotationKind) => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(0);
+    const node = range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? range.startContainer as Element
+      : range.startContainer.parentElement;
+    const page = node?.closest<HTMLElement>('[data-pdf-page]');
+    if (!page) return;
+    const pageRect = page.getBoundingClientRect();
+    if (!pageRect.width || !pageRect.height) return;
+    const rects = selectionRects(range, pageRect);
+    if (!rects.length) return;
+    const quote = selection.toString().trim().replace(/\s+/g, ' ').slice(0, 2000);
+    const pageIndex = Number(page.dataset.pdfPage) - 1;
+    selection.removeAllRanges();
+    void createFromSelection(kind, { pageIndex, rects, quote });
+  };
   const evidence = sources.flatMap((source, index) => {
     const pageIndex = source.page_index;
     const rects = source.rects ?? [];
@@ -347,6 +485,32 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
             disabled={zoom >= 3} onClick={() => setZoom(value => Math.min(3, value * 1.1))}>+</button>
           <span className="text-xs text-gray-500 dark:text-slate-400">Ctrl + 滚轮缩放</span>
           <a href={url} target="_blank" rel="noopener noreferrer" className="text-brand-600 underline">打开原文件</a>
+          {onCreateAnnotation && (
+            <>
+              <span className="mx-1 h-4 w-px bg-gray-300 dark:bg-slate-600" />
+              <span className="text-xs text-gray-500 dark:text-slate-400">标注：</span>
+              {(['highlight', 'underline'] as const).map(kind => (
+                <button
+                  key={kind}
+                  type="button"
+                  className={`rounded border px-2 py-0.5 text-xs transition-colors ${
+                    annotationMode === kind
+                      ? 'border-brand-600 bg-brand-600 text-white'
+                      : 'border-gray-300 hover:bg-gray-100 dark:border-slate-600 dark:hover:bg-slate-700'
+                  }`}
+                  onMouseDown={event => event.preventDefault()}
+                  onClick={() => {
+                    const next = annotationMode === kind ? null : kind;
+                    setAnnotationMode(next);
+                    if (next) applyCurrentSelection(next);
+                  }}
+                >
+                  {kind === 'highlight' ? '高亮' : '下划线'}
+                </button>
+              ))}
+              {annotationMode && <span className="text-xs text-gray-500 dark:text-slate-400">用鼠标选中文字即可标注</span>}
+            </>
+          )}
         </div>
         {evidence.length > 0 && (
           <div className="flex max-h-24 flex-wrap items-center gap-2 overflow-auto" aria-label="引用片段">
@@ -371,7 +535,10 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
           {Array.from({ length: totalPages }, (_, index) => (
             <PdfPage key={index + 1} page={pages.get(index + 1)} pageNumber={index + 1}
               ratio={initialRatio} requestPage={requestPage} scroller={scroller}
-              width={availableWidth * zoom} rects={highlights.get(index) ?? emptyRects} />
+              width={availableWidth * zoom} rects={highlights.get(index) ?? emptyRects}
+              annotations={annotationsByPage.get(index) ?? []}
+              annotationMode={annotationMode}
+              onSelect={onCreateAnnotation ? handleSelection : undefined} />
           ))}
         </div>}
       </div>

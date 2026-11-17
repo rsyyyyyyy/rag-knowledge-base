@@ -22,6 +22,7 @@ export interface DocumentViewResponse {
   url?: string;
   message?: string;
   directory?: DirectoryItem[];
+  version_id?: string;
 }
 
 export const getDocumentView = async (documentId: string, includePdfText = true): Promise<DocumentViewResponse> => {
@@ -32,6 +33,110 @@ export const getDocumentView = async (documentId: string, includePdfText = true)
     throw new Error(data?.detail || 'Failed to load document view');
   }
   return data as DocumentViewResponse;
+};
+
+export interface DocumentOutlineItem {
+  title: string;
+  level: number;
+  page_index: number;
+}
+
+export type AnnotationKind = 'highlight' | 'underline' | 'note';
+
+export interface PdfAnnotation {
+  id: string;
+  document_id: string;
+  version_id: string;
+  page_index: number;
+  kind: AnnotationKind;
+  color: string;
+  rects: [number, number, number, number][];
+  quote: string;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AnnotationDraft {
+  page_index: number;
+  kind: AnnotationKind;
+  color: string;
+  rects: [number, number, number, number][];
+  quote: string;
+  note: string;
+}
+
+export const getDocumentOutline = async (documentId: string): Promise<DocumentOutlineItem[]> => {
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/outline`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Failed to load document outline');
+  }
+  return (data.outline ?? []) as DocumentOutlineItem[];
+};
+
+export const getDocumentAnnotations = async (
+  documentId: string,
+  versionId: string,
+): Promise<PdfAnnotation[]> => {
+  const params = new URLSearchParams({ version_id: versionId });
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/annotations?${params}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Failed to load PDF annotations');
+  }
+  return (data.annotations ?? []) as PdfAnnotation[];
+};
+
+export const createDocumentAnnotation = async (
+  documentId: string,
+  versionId: string,
+  draft: AnnotationDraft,
+): Promise<PdfAnnotation> => {
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/annotations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...draft, version_id: versionId }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Failed to create PDF annotation');
+  }
+  return data as PdfAnnotation;
+};
+
+export const updateDocumentAnnotation = async (
+  documentId: string,
+  annotationId: string,
+  patch: { note?: string; color?: string; kind?: AnnotationKind },
+): Promise<PdfAnnotation> => {
+  const response = await fetch(
+    `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/annotations/${encodeURIComponent(annotationId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Failed to update PDF annotation');
+  }
+  return data as PdfAnnotation;
+};
+
+export const deleteDocumentAnnotation = async (
+  documentId: string,
+  annotationId: string,
+): Promise<void> => {
+  const response = await fetch(
+    `${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/annotations/${encodeURIComponent(annotationId)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok && response.status !== 204) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.detail || 'Failed to delete PDF annotation');
+  }
 };
 
 // 文档类型
@@ -548,7 +653,17 @@ export const reindexDocument = async (docId: string): Promise<{ message: string;
 };
 
 // 更新文档元数据
-export const updateDocumentMetadata = async (docId: string, metadata: { tags?: string[]; source?: string; project?: string; author?: string }): Promise<{ message: string; document: Document }> => {
+export const updateDocumentMetadata = async (docId: string, metadata: {
+  tags?: string[];
+  source?: string;
+  project?: string;
+  author?: string;
+  authors?: string;
+  title?: string;
+  doi?: string;
+  year?: number | string;
+  venue?: string;
+}): Promise<{ message: string; document: Document }> => {
   const params = new URLSearchParams();
   if (metadata.tags) {
     params.append('tags', metadata.tags.join(','));
@@ -562,6 +677,21 @@ export const updateDocumentMetadata = async (docId: string, metadata: { tags?: s
   if (metadata.author) {
     params.append('author', metadata.author);
   }
+  if (metadata.authors) {
+    params.append('authors', metadata.authors);
+  }
+  if (metadata.title) {
+    params.append('title', metadata.title);
+  }
+  if (metadata.doi) {
+    params.append('doi', metadata.doi);
+  }
+  if (metadata.year !== undefined && metadata.year !== '') {
+    params.append('year', String(metadata.year));
+  }
+  if (metadata.venue) {
+    params.append('venue', metadata.venue);
+  }
 
   const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(docId)}/metadata?${params.toString()}`, {
     method: 'PUT',
@@ -570,6 +700,31 @@ export const updateDocumentMetadata = async (docId: string, metadata: { tags?: s
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(error?.detail || 'Failed to update document metadata');
+  }
+
+  return response.json();
+};
+
+// 自动补全文献元数据
+export const enrichDocumentMetadata = async (
+  docIds?: string[],
+  force = false,
+  limit = 10,
+): Promise<{ updated: Document[]; failed: string[]; remaining: number; message: string }> => {
+  const params = new URLSearchParams();
+  if (docIds?.length) {
+    params.append('doc_ids', docIds.join(','));
+  }
+  params.append('force', String(force));
+  params.append('limit', String(limit));
+
+  const response = await fetch(`${API_BASE_URL}/documents/enrich-metadata?${params.toString()}`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error?.detail || 'Failed to enrich document metadata');
   }
 
   return response.json();
