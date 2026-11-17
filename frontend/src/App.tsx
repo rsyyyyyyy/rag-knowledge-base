@@ -5,7 +5,7 @@ import { Modal, Input, Select, Tooltip, message } from 'antd';
 import type { ChatThread, ChatTurn, Source } from './services/api';
 import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/OnlinePaperSearch';
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
-import { chatStream, listChatThreads, createChatThread, getChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -35,6 +35,15 @@ interface Message {
   content: string;
   sources?: Source[];
   complete?: boolean; // 标记消息是否完成
+}
+
+function presentAnswer(content: string) {
+  // Hide legacy operational notices without rewriting stored conversations.
+  return content.split('\n').filter(line => !(
+    /^\*\*(全文阅读|文献概览|引用定位)\*\*/.test(line)
+    || /^已读取 \d+\/\d+ 个正文片段。/.test(line)
+    || line === '长文已分批阅读并汇总；汇总可能省略细节，可继续针对具体章节追问。'
+  )).join('\n').trimStart();
 }
 
 function chatMessages(turns: ChatTurn[]): Message[] {
@@ -102,9 +111,10 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
+  const [renamingThread, setRenamingThread] = useState<ChatThread | null>(null);
+  const [threadName, setThreadName] = useState('');
   const [historyLoading, setHistoryLoading] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
-  const [tokenUsage, setTokenUsage] = useState(0);
   const [ragEnabled, setRagEnabled] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [chatAttachment, setChatAttachment] = useState<{
@@ -919,22 +929,67 @@ function App() {
     return () => { active = false; };
   }, []);
 
+  const applyChatThread = (id: string | null, turns: ChatTurn[] = []) => {
+    followChatRef.current = true;
+    setThreadId(id);
+    setMessages(chatMessages(turns));
+    setInputValue('');
+    setShowCommandHint(false);
+    setChatAttachment(null);
+    setPendingAttachmentFile(null);
+    setShowAttachmentChoice(false);
+    setReferenceFile(null);
+    setRagEnabled(true);
+    setActiveTab('ask');
+  };
+
+  const handleRenameChatThread = async () => {
+    const title = threadName.trim();
+    if (!renamingThread || historyLoading || isLoading || chatInFlightRef.current) return;
+    if (!title) { message.warning('请输入会话名称。'); return; }
+    setHistoryLoading(true);
+    try {
+      const updated = await renameChatThread(renamingThread.id, title);
+      setChatThreads(previous => previous.map(item => item.id === updated.id ? updated : item));
+      setRenamingThread(null);
+      message.success('会话已重命名。');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '重命名失败。');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const confirmDeleteChatThread = (thread: ChatThread) => {
+    if (historyLoading || isLoading || chatInFlightRef.current) return;
+    Modal.confirm({
+      title: '删除会话',
+      content: `确定删除“${thread.title}”及其全部聊天记录吗？删除后无法恢复，知识库文献会保留。`,
+      okText: '删除', cancelText: '取消', okButtonProps: { danger: true },
+      onOk: async () => {
+        if (historyLoading || isLoading || chatInFlightRef.current) return Promise.reject();
+        setHistoryLoading(true);
+        try {
+          await deleteChatThread(thread.id);
+          setChatThreads(previous => previous.filter(item => item.id !== thread.id));
+          if (thread.id === threadId) applyChatThread(null);
+          message.success('会话已删除。');
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '删除失败。');
+          throw error;
+        } finally {
+          setHistoryLoading(false);
+        }
+      },
+    });
+  };
+
   const switchChatThread = async (id: string | null) => {
     if (historyLoading || isLoading || chatInFlightRef.current) return;
     setHistoryLoading(true);
     try {
       const turns = id ? (await getChatThread(id)).turns : [];
-      followChatRef.current = true;
-      setThreadId(id);
-      setMessages(chatMessages(turns));
-      setInputValue('');
-      setShowCommandHint(false);
-      setChatAttachment(null);
-      setPendingAttachmentFile(null);
-      setShowAttachmentChoice(false);
-      setReferenceFile(null);
-      setRagEnabled(true);
-      setActiveTab('ask');
+      applyChatThread(id, turns);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '无法打开历史对话。');
     } finally {
@@ -1004,14 +1059,13 @@ function App() {
             reply.id === replyId ? { ...reply, content: reply.content + chunk } : reply
           ));
         },
-        (sources, tokenUsage) => {
+        sources => {
           const linkedSources = sources.map(source => source.id === 'attachment' && attachment?.basis
             ? { ...source, attachmentBasis: attachment.basis, sourceUrl: attachment.sourceUrl }
             : source);
           setMessages(previous => previous.map(reply =>
             reply.id === replyId ? { ...reply, complete: true, sources: linkedSources } : reply
           ));
-          setTokenUsage(previous => previous + tokenUsage);
           setChatThreads(previous => {
             const thread = previous.find(item => item.id === id)
               ?? { id, title: question.replace(/\s+/g, ' ').slice(0, 60) };
@@ -1073,20 +1127,6 @@ function App() {
           <div className="flex items-center space-x-2 bg-gray-100 dark:bg-slate-800 px-3 py-1.5 rounded-full shadow-sm">
             <Icon icon="simple-icons:deepseek" className="text-brand-500" />
             <span className="text-sm font-medium">DeepSeek Flash</span>
-          </div>
-          {/* 技术感知：向量库状态 */}
-          <div className="hidden md:flex items-center space-x-4 border-l border-gray-200 dark:border-slate-800 pl-6">
-            <div className="flex flex-col items-end">
-              <span className="text-[10px] text-gray-400 uppercase leading-none mb-1">Token 消耗量</span>
-              <div className="w-24 h-1.5 bg-gray-200 dark:bg-slate-700 rounded-full overflow-hidden">
-                <div className="bg-brand-500 h-full w-[45%] transition-all duration-1000 ease-in-out"></div>
-              </div>
-              <span className="text-[10px] text-gray-500 mt-1">{tokenUsage} tokens</span>
-            </div>
-            <div className="flex items-center space-x-1" title="本地部署环境">
-              <Icon icon="solar:lock-bold-duotone" className="text-gray-400" />
-              <span className="text-xs text-gray-500">Local Privacy Mode</span>
-            </div>
           </div>
           {/* 深色模式切换 */}
           <button
@@ -1150,14 +1190,39 @@ function App() {
                   </button>
                 </div>
                 {chatThreads.map(thread => (
-                  <button key={thread.id} type="button" title={thread.title}
-                    aria-current={thread.id === threadId ? 'true' : undefined}
-                    disabled={isLoading || historyLoading}
-                    onClick={() => void switchChatThread(thread.id)}
-                    className="block w-full truncate rounded-lg px-3 py-2 text-left text-xs hover:bg-gray-100 aria-current:bg-brand-100 dark:hover:bg-slate-800 dark:aria-current:bg-slate-800">
-                    {thread.title}
-                  </button>
+                  <div key={thread.id} className="flex items-center gap-0.5 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-800">
+                    <button type="button" title={thread.title}
+                      aria-current={thread.id === threadId ? 'true' : undefined}
+                      disabled={isLoading || historyLoading}
+                      onClick={() => void switchChatThread(thread.id)}
+                      className="min-w-0 flex-1 truncate rounded-lg px-3 py-2 text-left text-xs aria-current:bg-brand-100 dark:aria-current:bg-slate-800 disabled:opacity-50">
+                      {thread.title}
+                    </button>
+                    <button type="button" aria-label={`重命名会话 ${thread.title}`} title="重命名会话"
+                      disabled={isLoading || historyLoading}
+                      className="shrink-0 rounded p-1.5 text-gray-500 hover:text-brand-600 disabled:opacity-50"
+                      onClick={() => { setRenamingThread(thread); setThreadName(thread.title); }}>
+                      <Icon icon="solar:pen-linear" />
+                    </button>
+                    <button type="button" aria-label={`删除会话 ${thread.title}`} title="删除会话"
+                      disabled={isLoading || historyLoading}
+                      className="shrink-0 rounded p-1.5 text-gray-500 hover:text-red-600 disabled:opacity-50"
+                      onClick={() => confirmDeleteChatThread(thread)}>
+                      <Icon icon="solar:trash-bin-trash-linear" />
+                    </button>
+                  </div>
                 ))}
+                <Modal title="重命名会话" open={renamingThread !== null}
+                  okText="保存" cancelText="取消" confirmLoading={historyLoading}
+                  onOk={() => void handleRenameChatThread()}
+                  onCancel={() => { if (!historyLoading) setRenamingThread(null); }}
+                  closable={!historyLoading} maskClosable={!historyLoading} keyboard={!historyLoading}
+                  destroyOnHidden>
+                  <Input autoFocus aria-label="会话名称" placeholder="请输入会话名称"
+                    value={threadName} maxLength={100} showCount disabled={historyLoading}
+                    onChange={event => setThreadName(event.target.value)}
+                    onPressEnter={() => void handleRenameChatThread()} />
+                </Modal>
               </section>
             )}
 
@@ -1267,7 +1332,7 @@ function App() {
                               ) : (
                                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
                                   a: ({ href, children }) => {
-                                    const match = /^#evidence-(\d+)$/.exec(href ?? '');
+                                    const match = /^[^#]*#evidence-(\d+)$/.exec(href ?? '');
                                     if (!match) return <a href={href}>{children}</a>;
                                     const source = message.sources?.find(item => item.citation_number === Number(match[1]));
                                     if (!source) return <span>{children}</span>;
@@ -1279,7 +1344,7 @@ function App() {
                                       })}>{children}</button>;
                                   },
                                 }}>
-                                  {message.complete === false ? formatStreamingMarkdown(message.content) : message.content}
+                                  {message.complete === false ? formatStreamingMarkdown(presentAnswer(message.content)) : presentAnswer(message.content)}
                                 </ReactMarkdown>
                               )}
                             </div>

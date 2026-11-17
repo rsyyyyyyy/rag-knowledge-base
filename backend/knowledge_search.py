@@ -111,6 +111,13 @@ class KnowledgeSearchService:
         """, (expression, *generations, limit))]
 
     def _chunks(self, db, chunk_ids):
+        if not chunk_ids:
+            return {}
+        if len(chunk_ids) > 400:
+            rows = {}
+            for start in range(0, len(chunk_ids), 400):
+                rows.update(self._chunks(db, chunk_ids[start:start + 400]))
+            return rows
         return {
             chunk_id: {
                 "id": chunk_id, "content": content, "metadata": json.loads(metadata),
@@ -204,7 +211,12 @@ class KnowledgeReadSession:
                 ],
             }
 
-    def overview(self, document_limit=8):
+    def read_documents(self):
+        """Snapshot every active passage in scope, ordered by document and chunk.
+
+        The index lock pins versions while materializing sources. No network calls
+        occur under this lock. PDF positions remain on the original evidence.
+        """
         with self.service.ingestion.index_lock, self.service.catalog.connect() as db:
             documents = self.service._documents(self.scope)
             active = self.service._active(documents)
@@ -213,23 +225,18 @@ class KnowledgeReadSession:
             ), reverse=True)
             chunk_ids = []
             covered = 0
-            for doc_id in ordered[:document_limit]:
-                generation, _ = active[doc_id]
+            for doc_id in ordered:
                 rows = db.execute("""
-                    SELECT id, content FROM indexed_chunks WHERE generation = ?
-                    ORDER BY rowid
-                """, (generation,)).fetchall()
-                if not rows:
-                    continue
-                # Prefer abstract and conclusion, with first/last text as fallbacks.
-                abstract = next((row for row in rows if row[1].lstrip().lower().startswith(("abstract", "摘要"))), rows[0])
-                conclusion = next((row for row in reversed(rows) if row[1].lstrip().lower().startswith(("conclusion", "结论", "总结"))), rows[-1])
-                first = [abstract[0], rows[0][0], conclusion[0]]
-                if len(set(first)) < 3 and len(rows) > 2:
-                    first.append(rows[1][0])
-                chunk_ids.extend(list(dict.fromkeys(first))[:3])
-                covered += 1
+                    SELECT id FROM indexed_chunks WHERE generation = ?
+                    ORDER BY CAST(json_extract(metadata, '$.chunk_index') AS INTEGER), rowid
+                """, (active[doc_id][0],)).fetchall()
+                if rows:
+                    covered += 1
+                chunk_ids.extend(row[0] for row in rows)
             return self.read_passages(chunk_ids), covered, len(documents), len(active)
+
+    def overview(self):
+        return self.read_documents()
 
     def search_knowledge(self, query, limit=8, mode: RetrievalMode = "hybrid"):
         return [

@@ -261,18 +261,23 @@ export interface ChatTurn {
   sources: Source[];
 }
 
-async function requestChatHistory<T>(path: string, method = 'GET'): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}/chat/threads${path}`, { method });
+async function requestChatHistory<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}/chat/threads${path}`, {
+    method,
+    ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(typeof error.detail === 'string' ? error.detail : '无法读取或保存会话。');
   }
-  return response.json() as Promise<T>;
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
 export const listChatThreads = () => requestChatHistory<{ threads: ChatThread[] }>('');
 export const createChatThread = () => requestChatHistory<{ id: string }>('', 'POST');
 export const getChatThread = (id: string) => requestChatHistory<{ turns: ChatTurn[] }>(`/${encodeURIComponent(id)}`);
+export const renameChatThread = (id: string, title: string) => requestChatHistory<ChatThread>(`/${encodeURIComponent(id)}`, 'PATCH', { title });
+export const deleteChatThread = (id: string) => requestChatHistory<void>(`/${encodeURIComponent(id)}`, 'DELETE');
 
 export const chatStream = async (
   question: string,

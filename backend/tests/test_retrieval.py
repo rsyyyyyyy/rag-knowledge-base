@@ -118,9 +118,10 @@ class RetrievalIntegrationTest(TestCase):
             usage=SimpleNamespace(total_tokens=12),
         )
 
-        def ask(question, route, *, scope=None, folders=(), names=(), count=False, stream=False):
+        def ask(question, route, *, scope=None, folders=(), names=(), count=False, stream=False, reference="explicit", indices=()):
             payload = {"question": question, **(scope or {})}
-            plan = QuestionPlan(route=route, folder_names=list(folders), document_names=list(names), count_only=count)
+            plan = QuestionPlan(route=route, folder_names=list(folders), document_names=list(names), count_only=count,
+                                reference_mode=reference, reference_indices=list(indices))
             with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(plan, 5)):
                 create = factory.return_value.chat.completions.create
                 create.return_value = completion
@@ -172,17 +173,92 @@ class RetrievalIntegrationTest(TestCase):
 
         report, create = ask("总结一下知识库中的所有文献", "overview",
                              scope={"document_ids": [aurora, northwind]})
-        self.assertIn("2/2", report["answer"])
+        self.assertEqual(report["reading"]["documents"], 2)
+        self.assertNotIn("个正文片段", report["answer"])
+        self.assertNotIn("长文已分批", report["answer"])
         self.assertEqual({source["id"] for source in report["sources"]}, {aurora, northwind})
         context = create.call_args.kwargs["messages"][-1]["content"]
         self.assertIn("37 hours", context)
         self.assertIn("23 hours", context)
         single, _ = ask("总结Aurora Protocol.pdf文献", "overview", names=["Aurora Protocol.pdf"])
-        self.assertIn("1/1", single["answer"])
+        self.assertEqual(single["reading"]["documents"], 1)
         self.assertEqual({source["id"] for source in single["sources"]}, {aurora})
+        full, create = ask("这篇实验的最终结果是什么？", "evidence",
+                           scope={"document_ids": [aurora], "top_k": 1})
+        self.assertEqual(full["reading"]["chunks_total"], 2)
+        self.assertEqual(full["reading"]["chunks_read"], 2)
+        self.assertIn("37 hours", create.call_args.kwargs["messages"][-1]["content"])
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="实验结果为37小时 [2](#evidence-2)"))])
+                yield SimpleNamespace(usage=SimpleNamespace(total_tokens=12), choices=[])
+
+        with patch("app.get_deepseek_client") as factory, patch("app.plan_question", return_value=(
+            QuestionPlan(route="overview"), 5,
+        )):
+            factory.return_value.chat.completions.create.return_value = FakeStream()
+            response = client.post("/api/chat?stream=true", json={
+                "question": "完整介绍这篇", "document_ids": [aurora],
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            frames = [json.loads(line) for line in response.iter_lines()]
+            self.assertEqual(frames[-1]["reading"]["chunks_read"], 2)
+            self.assertEqual(frames[-1]["token_usage"], 17)
+            self.assertEqual(frames[-2]["type"], "sources")
+            self.assertTrue(frames[-2]["sources"][-1]["rects"])
+        # More than the previous eight-document cap: every active paper is read.
+        all_docs, _ = ask("完整概括所有文献", "overview")
+        self.assertEqual(all_docs["reading"]["documents"], 17)
+        self.assertEqual(len({s["id"] for s in all_docs["sources"]}), 17)
         general, create = ask("什么是向量数据库？", "general")
         self.assertIn("通用回答", general["answer"])
         create.assert_called_once()
+
+        thread_id = checked(client.post("/api/chat/threads"), 201)["id"]
+        base_scope = {"thread_id": thread_id, "document_ids": [aurora, northwind, density]}
+        shown, _ = ask("列出这三篇", "documents", scope=base_scope)
+        self.assertIn("Aurora Protocol.pdf", shown["answer"])
+        selected, _ = ask("Aurora Protocol.pdf", "file_status", scope={"thread_id": thread_id},
+                           names=["Aurora Protocol.pdf"])
+        self.assertIn("你想如何阅读", selected["answer"])
+        still_there, _ = ask("刚才提到的文献还在吗", "file_status",
+                             scope={"thread_id": thread_id}, reference="focus",
+                             names=["invented-history-filename.pdf"])
+        self.assertIn("Aurora Protocol.pdf", still_there["answer"])
+        self.assertNotIn("没有找到", still_there["answer"])
+        others, _ = ask("除了这个文献另外两篇呢", "file_status",
+                        scope={"thread_id": thread_id}, reference="others")
+        self.assertIn("Northwind Study.txt", others["answer"])
+        self.assertIn("非参数聚类.txt", others["answer"])
+        self.assertNotIn("Aurora Protocol.pdf", others["answer"])
+        unknown, _ = ask("does-not-exist.pdf", "file_status",
+                         scope={"thread_id": thread_id}, names=["does-not-exist.pdf"])
+        self.assertIn("没有找到", unknown["answer"])
+        focused, _ = ask("介绍一下它们", "overview", scope={"thread_id": thread_id}, reference="focus")
+        self.assertEqual({source["id"] for source in focused["sources"]}, {northwind, density})
+        self.assertEqual(focused["reading"]["documents"], 2)
+        new_thread = checked(client.post("/api/chat/threads"), 201)["id"]
+        isolated, _ = ask("刚才那篇还在吗", "file_status",
+                          scope={"thread_id": new_thread}, reference="focus")
+        self.assertIn("请明确", isolated["answer"])
+        managed = checked(client.post('/api/chat/threads'), 201)['id']
+        renamed = checked(client.patch('/api/chat/threads/' + managed, json={'title': '  专题   阅读  '}))
+        self.assertEqual(renamed['title'], '专题 阅读')
+        self.assertIn(renamed['id'], [t['id'] for t in checked(client.get('/api/chat/threads'))['threads']])
+        checked(client.patch('/api/chat/threads/' + managed, json={'title': '   '}), 422)
+        checked(client.patch('/api/chat/threads/' + managed, json={'title': '字' * 101}), 422)
+        self.assertEqual(client.delete('/api/chat/threads/' + managed).status_code, 204)
+        checked(client.get('/api/chat/threads/' + managed), 404)
+        checked(client.patch('/api/chat/threads/' + managed, json={'title': '不存在'}), 404)
+        checked(client.delete('/api/chat/threads/' + managed), 404)
+        self.assertTrue(checked(client.get('/api/documents'))['documents'])
 
         cases = [
             ("identifier", "PX-914", {aurora}),

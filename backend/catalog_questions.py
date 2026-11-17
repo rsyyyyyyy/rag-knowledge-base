@@ -84,10 +84,15 @@ def resolve_question_scope(question, plan, scope, service):
         names = {normalized(documents[doc_id]["filename"]) for doc_id in mentioned}
         if len(names) != len(mentioned):
             return scope, "找到同名文献，请指定所在文件夹。"
-    return KnowledgeScope(document_ids=sorted(resolved), folder_ids=scope.folder_ids), None
+    ordered = sorted(resolved, key=lambda doc_id: (
+        query.find(normalized(documents[doc_id].get("filename") or ""))
+        if normalized(documents[doc_id].get("filename") or "") in query else len(query),
+        doc_id,
+    ))
+    return KnowledgeScope(document_ids=ordered, folder_ids=scope.folder_ids), None
 
 
-def render_catalog_answer(plan, scope, service):
+def render_catalog_answer(plan, scope, service, *, listing=None):
     folders = service.catalog.load("folders")
     by_id = {folder["id"]: folder for folder in folders}
     default = default_folder_id(folders)
@@ -108,7 +113,8 @@ def render_catalog_answer(plan, scope, service):
             f"- {markdown_text(path)}（直接收录 {count} 篇）" for path, count in paths[:30]
         )
 
-    listing = service.session(scope).list_documents(limit=30)
+    if listing is None:
+        listing = service.session(scope).list_documents(limit=30)
     if plan.route == "file_status":
         if scope.document_ids is None:
             return "请提供要查询的文件名或文献标题。"
