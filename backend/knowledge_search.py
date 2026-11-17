@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from search_text import exact_document_match, match_expression
+from document_structure import STRUCTURE_VERSION
 
 
 RetrievalMode = Literal["hybrid", "vector"]
@@ -35,6 +36,15 @@ class PassageRequest(KnowledgeScope):
 class DocumentListRequest(KnowledgeScope):
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
+
+
+class SectionReadRequest(KnowledgeScope):
+    document_id: str = Field(min_length=1, max_length=200)
+    section_id: str = Field(min_length=1, max_length=200)
+    version_id: str | None = Field(default=None, max_length=128)
+    generation: str | None = Field(default=None, max_length=200)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=30, ge=1, le=100)
 
 
 def placeholders(values):
@@ -121,11 +131,13 @@ class KnowledgeSearchService:
         return {
             chunk_id: {
                 "id": chunk_id, "content": content, "metadata": json.loads(metadata),
-                "generation": generation, "doc_id": doc_id,
+                "generation": generation, "doc_id": doc_id, "section_id": section_id,
             }
-            for chunk_id, generation, doc_id, content, metadata in db.execute(f"""
-                SELECT id, generation, doc_id, content, metadata FROM indexed_chunks
-                WHERE id IN ({placeholders(chunk_ids)})
+            for chunk_id, generation, doc_id, content, metadata, section_id in db.execute(f"""
+                SELECT c.id, c.generation, c.doc_id, c.content, c.metadata, s.section_id
+                FROM indexed_chunks c LEFT JOIN section_passages s
+                ON s.chunk_id = c.id AND s.generation = c.generation
+                WHERE c.id IN ({placeholders(chunk_ids)})
             """, tuple(chunk_ids))
         }
 
@@ -183,6 +195,65 @@ class KnowledgeReadSession:
         self.service = service
         self.scope = KnowledgeScope(**scope.model_dump(include={"document_ids", "folder_ids"}))
         self.evidence = {}
+
+    def list_sections(self, document_id, version_id=None):
+        with self.service.ingestion.index_lock, self.service.catalog.connect() as db:
+            documents = self.service._documents(self.scope)
+            active = self.service._active(documents)
+            if document_id not in documents:
+                return None
+            if document_id not in active:
+                return {"document_id": document_id, "version_id": None, "generation": None,
+                        "structure_version": STRUCTURE_VERSION, "sections": []}
+            generation, current_version = active[document_id]
+            if version_id is not None and version_id != current_version:
+                raise ValueError("文献版本已更新，请重新打开文献后查看章节。")
+            rows = db.execute("""
+                SELECT id, parent_id, title, level, position, page_start, page_end,
+                       heading_detected, end_position - start_position + 1
+                FROM document_sections WHERE generation = ? ORDER BY position
+            """, (generation,)).fetchall()
+            sections = [
+                dict(zip(("id", "parent_id", "title", "level", "position", "page_start",
+                          "page_end", "heading_detected", "passage_count"), row, strict=True))
+                for row in rows
+            ]
+            return {"document_id": document_id, "version_id": current_version,
+                    "generation": generation, "structure_version": STRUCTURE_VERSION,
+                    "sections": sections}
+
+    def read_section(self, request: SectionReadRequest):
+        with self.service.ingestion.index_lock, self.service.catalog.connect() as db:
+            documents = self.service._documents(self.scope)
+            active = self.service._active(documents)
+            current = active.get(request.document_id)
+            if current is None:
+                return None
+            generation, version_id = current
+            if ((request.version_id is not None and request.version_id != version_id)
+                    or (request.generation is not None and request.generation != generation)):
+                raise ValueError("章节对应的文献或索引已更新，请重新打开章节。")
+            section = db.execute("""
+                SELECT title, start_position, end_position, page_start, page_end
+                FROM document_sections WHERE id = ? AND doc_id = ? AND generation = ?
+            """, (request.section_id, request.document_id, generation)).fetchone()
+            if section is None:
+                return None
+            title, start, end, page_start, page_end = section
+            ids = [row[0] for row in db.execute("""
+                SELECT chunk_id FROM section_passages
+                WHERE generation = ? AND position BETWEEN ? AND ?
+                ORDER BY position LIMIT ? OFFSET ?
+            """, (generation, start, end, request.limit, request.offset))]
+            evidence = self.read_passages(ids)
+            next_offset = request.offset + len(ids)
+            return {
+                "document_id": request.document_id, "version_id": version_id,
+                "generation": generation, "section_id": request.section_id,
+                "title": title, "page_start": page_start, "page_end": page_end,
+                "evidence": evidence, "total": end - start + 1,
+                "next_offset": next_offset if next_offset < end - start + 1 else None,
+            }
 
     def list_documents(self, offset=0, limit=20):
         with self.service.ingestion.index_lock:
@@ -246,6 +317,7 @@ class KnowledgeReadSession:
                 "page_index": row["metadata"].get("page_index"),
                 "version_id": row["version_id"],
                 "rank_signals": row["rank_signals"], "fusion_score": row["fusion_score"],
+                "section_id": row.get("section_id"),
             }
             for row in self.service.search(query, self.scope, limit, mode)
         ]
@@ -291,6 +363,7 @@ class KnowledgeReadSession:
                     "filename": documents[row["doc_id"]].get("filename") or meta.get("filename"),
                     "excerpt": row["content"],
                     "parser_version": meta.get("parser_version"),
+                    "section_id": row.get("section_id"),
                     "section_heading": meta.get("section_heading"),
                     "text_sha256": meta.get("text_sha256"),
                     "elements": json.loads(meta.get("elements_json") or "[]"),

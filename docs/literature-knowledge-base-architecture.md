@@ -130,6 +130,26 @@ NDJSON继续流式发送正文草稿，核验后发送 `answer` 事件作为最�
 
 参考实现：[Haiku.RAG 结构化切分](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/chunkers/docling_local.py)、[原文元素定位](https://github.com/ggozad/haiku.rag/blob/43a853004d14c13d5c15a032efa184e1bbd5efe1/haiku_rag_slim/haiku/rag/client/search.py)、[Kotaemon 引句匹配](https://github.com/Cinnamon/kotaemon/blob/9ad3e4e49aa35b8acddd235918a5d9753c1cfdf9/libs/kotaemon/kotaemon/indices/qa/citation_qa_inline.py)、[RAGFlow PDF合并与切分](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/ingestion/component/chunker/general.go)、[RAGFlow证据登记](https://github.com/infiniflow/ragflow/blob/441273988d4c1126b32aef02f21e7cfeb9eeeb33/internal/agentic_rag/evidence_registry.go)。
 
+### 章节结构与读取
+
+`document_structure.py` 从当前有序片段构建章节树。复用现有标题规则，保存父子关系、顺序、包含子章节的正文区间及页区间。SQLite 的 `document_sections`、`section_passages` 和 `section_index_versions` 分别保存章节、原始片段归属和结构配置。相同原件、解析配置及片段顺序重建时章节 ID 稳定，原件版本变化时生成新 ID。
+
+`IngestStore.initialize` 在事务中幂等补齐旧库结构，保留片段内容、ID、元素和坐标。`_activate` 将新结构与新正文在同一事务中发布，文献删除同时清理结构关系。旧会话继续使用既有引用快照和原文件版本。
+
+`GET /api/documents/{id}/sections` 返回当前章节及版本、代次。`POST /api/knowledge/read-section` 在当前文献范围内按原文顺序读取章节和子章节，支持 offset/limit，并拒绝过期版本或代次。读取结果沿用原文证据契约，并增加 `section_id`。章节读取与发布共用索引锁以固定单次读取的代次。
+
+阅读页的 `SectionReader` 提供章节选择、分页阅读和 PDF 文段定位。标题识别质量仍受现有解析结果影响。
+
+### 带证据的章节摘要与论文卡片（已实现）
+
+`document_profiles.py` 在活动索引锁内一次取得章节结构和全部已解析正文，固定文献版本与索引代次，释放锁后执行模型调用。按 UTF-8 字节预算分批阅读，生成单一事实的候选要点。每项保存 facet、摘要文字和逐字引句来源。应用复用 `quote_span` 定位原句、检查版本与正文哈希，并拒绝引句未包含的显式数值；独立模型步骤复核语义支持及所属类别。局限和适用条件须指向本论文，相关工作的问题不自动视为本论文局限。模型复核是质量控制，不能视为事实正确性的形式证明。
+
+论文卡片按研究问题、方法、发现、条件、局限选择各一至两条已核验要点。选择阶段只返回已有 ID，字段缺失保持空数组。章节摘要按原文所属章节归并，父章节包含子章节要点，原始正文始终独立保留。未读到可靠要点的章节明确显示缺失，不生成补全事实。摘要仅覆盖已解析文字，不保证覆盖扫描图表或所有论断。
+
+`profile_store.py` 使用 SQLite `profile_jobs` 持久化队列、批次检查点和任务状态，`document_profiles` 保存完整结果。单工作线程串行处理，避免新上传同时触发无限并发。提交、检查点和发布分别校验活动文献版本与代次，已删除或已替换文献的迟到结果不会发布。重复请求合并；失败重试及重启从检查点恢复，强制重新生成从头开始。缓存键包含索引代次、模型、提取/复核/选择 Prompt、结构版本和预算配置；变更时旧结果不会成为当前卡片。强制刷新失败保留此前有效缓存。任务用量、模型调用数和生成配置随结果保存。
+
+`GET /api/documents/{id}/profile` 查询当前状态及结果，`POST` 接受可选 `version_id` 与 `force`，返回 202。版本过期返回 409。`Ingestion.on_publish` 在索引成功提交后排队，卡片失败不会回滚可检索正文；`RAG_AUTO_PROFILE=0` 可关闭自动排队。阅读页 `PaperProfile.tsx` 展示五类卡片、章节摘要与可展开原句，沿现有来源契约回到 PDF 原页高亮，前端只展示任务进度与有效内容。论文级召回、全库专题和主题图谱仍待后续实现。
+
 ## 7 迁移、开发顺序与验收
 
 1. **先验证 PDF 坐标纵贯链路**。实现带版本的少量 PDF 解析与右栏页内高亮，测试中文、英文、双栏、旋转或裁切的样本，确认同一坐标在不同缩放下指向正确位置。这一步覆盖 FR-01 和 FR-06 的关键风险。

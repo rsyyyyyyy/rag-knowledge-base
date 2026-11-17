@@ -40,6 +40,7 @@ from knowledge_search import (
     KnowledgeSearch,
     KnowledgeSearchService,
     PassageRequest,
+    SectionReadRequest,
     RetrievalMode,
 )
 from pdf_evidence import pdf_version
@@ -50,6 +51,7 @@ from online_papers import public_link, router as online_papers_router
 from metadata_enrichment import build_metadata_updates, normalize_doi
 from outline import outline_for_document
 from annotations import AnnotationStore
+from document_profiles import DocumentProfiles
 
 DEEPSEEK_MODEL = "deepseek-flash"
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -387,19 +389,29 @@ def _parse_document_text(path: Path) -> str:
 
 ingestion = Ingestion(ingest_store, collection, local_embedding, _parse_document_text, chunk_text)
 knowledge_search = KnowledgeSearchService(ingestion)
+document_profiles = DocumentProfiles(
+    knowledge_search, lambda: get_deepseek_client(), DEEPSEEK_MODEL,
+    lambda error: deepseek_error(error).detail if isinstance(error, APIError) else (
+        str(error) if isinstance(error, ValueError) else "生成文献卡片失败，请重试。"
+    ),
+)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     ensure_storage_ready()
     annotation_store.initialize()
+    if os.getenv("RAG_AUTO_PROFILE", "true").lower() in {"1", "true", "yes"}:
+        ingestion.on_publish = document_profiles.enqueue
     ingestion.start(load_documents_meta(), _resolve_legacy_path)
+    document_profiles.start()
     if AUTO_METADATA_ENRICHMENT:
         Thread(target=_backfill_metadata, name="metadata-backfill", daemon=True).start()
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
+    document_profiles.stop()
     ingestion.stop()
 
 
@@ -930,6 +942,43 @@ def get_document_outline(doc_id: str):
         return {"outline": []}
 
 
+@app.get("/api/documents/{doc_id}/sections")
+def get_document_sections(doc_id: str, version_id: str | None = Query(default=None, max_length=128)):
+    _get_document(doc_id)
+    try:
+        result = knowledge_search.session(KnowledgeScope(document_ids=[doc_id])).list_sections(doc_id, version_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="文献已移出当前知识库。")
+    return result
+
+
+class ProfileRequest(BaseModel):
+    version_id: str | None = Field(default=None, max_length=128)
+    force: bool = False
+
+
+@app.get("/api/documents/{doc_id}/profile")
+def get_document_profile(doc_id: str, version_id: str | None = Query(default=None, max_length=128)):
+    _get_document(doc_id)
+    try:
+        return document_profiles.store.get(doc_id, document_profiles.config_key, version_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/documents/{doc_id}/profile", status_code=202)
+def generate_document_profile(doc_id: str, request: ProfileRequest):
+    _get_document(doc_id)
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="未配置 DeepSeek API 密钥（DEEPSEEK_API_KEY）")
+    try:
+        return document_profiles.enqueue(doc_id, request.force, request.version_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/api/documents/{doc_id}/annotations")
 def list_document_annotations(
     doc_id: str, version_id: str = Query(..., min_length=8, max_length=128),
@@ -999,6 +1048,17 @@ def read_knowledge(request: PassageRequest):
     if not excerpts:
         raise HTTPException(status_code=404, detail="片段不存在、已更新或不在当前文献范围。")
     return {"evidence": excerpts}
+
+
+@app.post("/api/knowledge/read-section")
+def read_knowledge_section(request: SectionReadRequest):
+    try:
+        result = knowledge_search.session(request).read_section(request)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail="章节不存在、已更新或不在当前文献范围。")
+    return result
 
 
 AGREEMENT_QUERY = "Krippendorff inter-rater reliability inter-coder reliability K-Alpha"

@@ -42,8 +42,10 @@ class RetrievalIntegrationTest(TestCase):
         with tempfile.TemporaryDirectory(prefix="rag-retrieval-", ignore_cleanup_errors=True) as directory:
             previous = os.environ.get("RAG_DATA_DIR")
             previous_auto_metadata = os.environ.get("RAG_AUTO_METADATA")
+            previous_auto_profile = os.environ.get("RAG_AUTO_PROFILE")
             os.environ["RAG_DATA_DIR"] = directory
             os.environ["RAG_AUTO_METADATA"] = "0"
+            os.environ["RAG_AUTO_PROFILE"] = "0"
             try:
                 import app
 
@@ -51,6 +53,10 @@ class RetrievalIntegrationTest(TestCase):
                 with TestClient(app.app) as client:
                     self.exercise(client)
             finally:
+                if previous_auto_profile is None:
+                    os.environ.pop("RAG_AUTO_PROFILE", None)
+                else:
+                    os.environ["RAG_AUTO_PROFILE"] = previous_auto_profile
                 if previous is None:
                     os.environ.pop("RAG_DATA_DIR", None)
                 else:
@@ -117,6 +123,21 @@ class RetrievalIntegrationTest(TestCase):
         controls = [upload(f"control-{i}.txt", text.encode(), energy if i < 5 else methods)
                     for i, text in enumerate(distractors)]
         wait_for({aurora, northwind, density, chinese, doi_only, *controls})
+        structure = checked(client.get(f"/api/documents/{aurora}/sections"))
+        self.assertEqual(checked(client.get(f"/api/documents/{aurora}/profile"))["state"], "not_generated")
+        checked(client.get(f"/api/documents/{aurora}/profile?version_id=retired"), 409)
+        self.assertTrue(structure["sections"])
+        section_id = structure["sections"][0]["id"]
+        payload = {
+            "document_id": aurora, "section_id": section_id,
+            "version_id": structure["version_id"], "generation": structure["generation"],
+        }
+        section = checked(client.post("/api/knowledge/read-section", json=payload))
+        self.assertTrue(section["evidence"])
+        self.assertEqual(section["evidence"][0]["id"], aurora)
+        self.assertEqual(section["evidence"][0]["section_id"], section_id)
+        checked(client.post("/api/knowledge/read-section", json={**payload, "document_ids": [northwind]}), 404)
+        checked(client.post("/api/knowledge/read-section", json={**payload, "generation": "outdated"}), 409)
         from question_router import QuestionPlan
 
         completion = SimpleNamespace(

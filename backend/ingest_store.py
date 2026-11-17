@@ -4,6 +4,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from search_text import index_text
+from document_structure import initialize_structure, replace_sections
+from profile_store import initialize_profiles
 
 
 class IngestStore:
@@ -53,6 +55,9 @@ class IngestStore:
             """)
 
         self._initialize_fts()
+        with self.transaction() as db:
+            initialize_structure(db)
+            initialize_profiles(db)
 
     def _initialize_fts(self):
         with self.transaction() as db:
@@ -176,6 +181,7 @@ class IngestStore:
             (chunk_id, generation, doc_id, content, json.dumps(metadata, ensure_ascii=False), tokens)
             for (chunk_id, content, metadata), tokens in zip(records, tokenized, strict=True)
         ))
+        replace_sections(db, doc_id, version_id, generation, records)
         db.execute("""
             INSERT INTO active_indexes VALUES (?, ?, ?)
             ON CONFLICT(doc_id) DO UPDATE SET
@@ -284,6 +290,15 @@ class IngestStore:
         paths = set()
         with self.transaction() as db:
             for doc_id in doc_ids:
+                db.execute("""
+                    DELETE FROM section_passages WHERE section_id IN (
+                        SELECT id FROM document_sections WHERE doc_id = ?
+                    )
+                """, (doc_id,))
+                db.execute("DELETE FROM document_sections WHERE doc_id = ?", (doc_id,))
+                db.execute("DELETE FROM section_index_versions WHERE doc_id = ?", (doc_id,))
+                db.execute("DELETE FROM document_profiles WHERE doc_id = ?", (doc_id,))
+                db.execute("DELETE FROM profile_jobs WHERE doc_id = ?", (doc_id,))
                 paths.update(row[0] for row in db.execute(
                     "SELECT path FROM document_versions WHERE doc_id = ?", (doc_id,),
                 ))

@@ -7,6 +7,8 @@ import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/Onli
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
 import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocumentOutline, getDocumentAnnotations, createDocumentAnnotation, deleteDocumentAnnotation, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary, enrichDocumentMetadata, updateDocumentMetadata } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
+import SectionReader from './components/SectionReader';
+import PaperProfile from './components/PaperProfile';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { citationNumberFromHref, remarkCitationLinks } from './citationLinks';
@@ -139,7 +141,14 @@ function App() {
   const outlineRequest = useRef(0);
   const [annotations, setAnnotations] = useState<PdfAnnotation[]>([]);
   const annotationsRequest = useRef(0);
-  const [viewerPanel, setViewerPanel] = useState<'summary' | 'annotations'>('summary');
+  const [viewerPanel, setViewerPanel] = useState<'summary' | 'annotations' | 'sections' | 'profile'>('summary');
+  const [sectionEvidence, setSectionEvidence] = useState<Source[]>([]);
+  const [sectionSelectionId, setSectionSelectionId] = useState(0);
+  const selectSectionPassage = useCallback((source: Source) => {
+    setSectionEvidence([source]);
+    setSectionSelectionId(value => value + 1);
+    setPdfPageJump(null);
+  }, []);
   const annotationHistory = useRef<AnnotationHistoryEntry[]>([]);
   const [canUndo, setCanUndo] = useState(false);
   const handlePdfPreviewError = useCallback(() => setDocumentViewError('无法加载 PDF 原件。'), []);
@@ -991,6 +1000,7 @@ function App() {
     const request = ++documentViewRequest.current;
     setPdfNavigation(null);
     setPdfPageJump(null);
+    setSectionEvidence([]);
     setSelectedDocument(doc);
     setIsDrawerOpen(true);
     setDocumentViewLoading(true);
@@ -2556,7 +2566,8 @@ function App() {
                         <React.Suspense fallback={<p role="status">正在加载 PDF 阅读器…</p>}>
                           <PdfReferencePreview key={selectedDocument.id}
                             url={getDocumentFileUrl(selectedDocument.id, activePdfVersionId)}
-                            sources={noPdfSources} onError={handlePdfPreviewError}
+                            sources={viewerPanel === 'sections' || viewerPanel === 'profile' ? sectionEvidence : noPdfSources}
+                            selectionId={sectionSelectionId} onError={handlePdfPreviewError}
                             onNavigation={setPdfNavigation} pageJump={pdfPageJump}
                             annotations={visibleAnnotations}
                             onCreateAnnotation={activePdfVersionId ? async draft => {
@@ -2671,7 +2682,23 @@ function App() {
             <div style={{ '--summary-width': summaryWidth + '%' } as React.CSSProperties}
               className="w-64 overflow-y-auto border-l border-gray-200 bg-gray-50 dark:border-slate-800 dark:bg-slate-900 lg:w-[var(--summary-width)] lg:shrink-0">
               <div className="border-b border-gray-200 p-3 dark:border-slate-800">
-                <div className="flex items-center gap-1">
+                <div className="flex flex-wrap items-center gap-1">
+                  {documentView?.view_type === 'pdf' && activePdfVersionId && (
+                    <button type="button" onClick={() => setViewerPanel('profile')}
+                      className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${viewerPanel === 'profile'
+                        ? 'bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
+                        : 'text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}>
+                      文献卡片
+                    </button>
+                  )}
+                  {documentView?.view_type === 'pdf' && activePdfVersionId && (
+                    <button type="button" onClick={() => setViewerPanel('sections')}
+                      className={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${viewerPanel === 'sections'
+                        ? 'bg-brand-100 text-brand-700 dark:bg-brand-900/30 dark:text-brand-300'
+                        : 'text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}>
+                      章节原文
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setViewerPanel('summary')}
@@ -2694,7 +2721,15 @@ function App() {
                 {pdfNavigation && <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">PDF 原文 · 共 {pdfNavigation.totalPages} 页</p>}
               </div>
               <div className="p-4">
-                {viewerPanel === 'annotations' ? (
+                {viewerPanel === 'profile' && activePdfVersionId ? (
+                  <PaperProfile key={selectedDocument.id + activePdfVersionId}
+                    documentId={selectedDocument.id} versionId={activePdfVersionId}
+                    onSelectPassage={selectSectionPassage} />
+                ) : viewerPanel === 'sections' && activePdfVersionId ? (
+                  <SectionReader key={selectedDocument.id + activePdfVersionId}
+                    documentId={selectedDocument.id} versionId={activePdfVersionId}
+                    onSelectPassage={selectSectionPassage} />
+                ) : viewerPanel === 'annotations' ? (
                   visibleAnnotations.length === 0 ? (
                     <p className="text-sm text-gray-500">还没有标注。选中文字后使用高亮或下划线。</p>
                   ) : (

@@ -41,6 +41,108 @@ export interface DocumentOutlineItem {
   page_index: number;
 }
 
+export interface DocumentSection {
+  id: string;
+  parent_id: string | null;
+  title: string;
+  level: number;
+  position: number;
+  page_start: number | null;
+  page_end: number | null;
+  heading_detected: boolean | number;
+}
+
+export interface DocumentStructure {
+  document_id: string;
+  version_id: string | null;
+  generation: string | null;
+  structure_version: string;
+  sections: DocumentSection[];
+}
+
+export interface SectionReading {
+  section_id: string;
+  title: string;
+  version_id: string;
+  generation: string;
+  evidence: Source[];
+  total: number;
+  next_offset: number | null;
+}
+
+export type ProfileFacet = 'research_question' | 'methodology' | 'findings' | 'conditions' | 'limitations';
+
+export interface ProfileNote {
+  id: string;
+  facet: ProfileFacet | 'overview';
+  text: string;
+  evidence: Source[];
+}
+
+export interface ReadingArtifact {
+  version_id: string;
+  generation: string;
+  model: string;
+  created_at: string;
+  partial: boolean;
+  fields: Record<ProfileFacet, string[]>;
+  notes: ProfileNote[];
+  sections: (DocumentSection & { note_ids: string[]; status: 'ready' | 'not_confirmed' })[];
+}
+
+export interface ProfileResponse {
+  state: 'not_ready' | 'not_generated' | 'queued' | 'processing' | 'ready' | 'partial' | 'failed' | 'cancelled';
+  artifact: ReadingArtifact | null;
+  error: string | null;
+  progress: { completed: number; total: number; stage: string } | null;
+}
+
+export async function getDocumentProfile(documentId: string, versionId: string, signal?: AbortSignal): Promise<ProfileResponse> {
+  const params = new URLSearchParams({ version_id: versionId });
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/profile?${params}`, { signal });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || '读取文献卡片失败');
+  return data;
+}
+
+export async function generateDocumentProfile(
+  documentId: string, versionId: string, force = false, signal?: AbortSignal,
+): Promise<ProfileResponse> {
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/profile`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version_id: versionId, force }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || '生成文献卡片失败');
+  return data;
+}
+
+export async function getDocumentSections(documentId: string, versionId: string, signal?: AbortSignal): Promise<DocumentStructure> {
+  const params = new URLSearchParams({ version_id: versionId });
+  const response = await fetch(`${API_BASE_URL}/documents/${encodeURIComponent(documentId)}/sections?${params}`, { signal });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || '读取章节失败');
+  return data;
+}
+
+export async function readDocumentSection(
+  documentId: string, sectionId: string, versionId: string,
+  generation: string, offset = 0, signal?: AbortSignal,
+): Promise<SectionReading> {
+  const response = await fetch(`${API_BASE_URL}/knowledge/read-section`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      document_id: documentId, section_id: sectionId,
+      document_ids: [documentId], version_id: versionId, generation, offset, limit: 10,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || '读取章节正文失败');
+  return data;
+}
+
 export type AnnotationKind = 'highlight' | 'underline' | 'note';
 
 export interface PdfAnnotation {
@@ -165,6 +267,7 @@ export interface RetrievedDocument extends Document {
 
 // 来源类型
 export interface Source {
+  section_id?: string | null;
   evidence_id?: string;
   citation_number?: number;
   citation_precision?: 'fragment' | 'page' | 'line' | 'quote' | 'text';

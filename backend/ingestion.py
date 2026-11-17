@@ -25,6 +25,7 @@ class Ingestion:
         self.wake = Event()
         self.stopping = Event()
         self.worker = None
+        self.on_publish = None
 
     def start(self, documents, resolve_path):
         self.store.initialize()
@@ -176,6 +177,11 @@ class Ingestion:
                     self._delete_generation(job_id)
                 elif previous:
                     self._delete_generation(previous)
+            if published and self.on_publish:
+                try:
+                    self.on_publish(doc_id)
+                except Exception:
+                    logger.exception("Could not queue document reading artifacts for %s", doc_id)
         except Exception:
             logger.exception("Indexing failed for document %s, job %s", doc_id, job_id)
             self._delete_generation(job_id)

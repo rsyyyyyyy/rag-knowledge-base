@@ -100,6 +100,11 @@ def locate_quote(text, quote):
     return offsets[start], offsets[start + len(needle) - 1] + 1
 
 
+def explicit_numbers(text):
+    text = re.sub(r'(?<=\d),(?=\d{3}(?:\D|$))', '', text)
+    return {Decimal(n) for n in re.findall(r'(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', text)}
+
+
 def quote_span(source, quote):
     if (source.get('version_id') and source.get('document_version_id')
             and source['version_id'] != source['document_version_id']):
@@ -242,10 +247,7 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
                 evidence = quote_span(candidate, quote)
                 # Reject an explicit numerical claim whose values are absent from its quote,
                 # even if the semantic model incorrectly marks it supported.
-                def numbers(text):
-                    text = re.sub(r'(?<=\d),(?=\d{3}(?:\D|$))', '', text)
-                    return {Decimal(n) for n in re.findall(r'(?<![A-Za-z0-9])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', text)}
-                if evidence and not numbers(claim) <= numbers(evidence['excerpt']):
+                if evidence and not explicit_numbers(claim) <= explicit_numbers(evidence['excerpt']):
                     evidence = None
                 if evidence:
                     evidence['claim'] = claim
