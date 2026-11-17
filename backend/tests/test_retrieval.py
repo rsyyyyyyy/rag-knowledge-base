@@ -345,6 +345,11 @@ class RetrievalIntegrationTest(TestCase):
             self.assertEqual(post("search", {"query": "PX-914", "document_ids": [aurora],
                                             "folder_ids": [methods], "retrieval_mode": mode})["candidates"], [])
         self.assertEqual(post("list", {"document_ids": [aurora, density], "folder_ids": [energy]})["total"], 1)
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': ''}):
+            papers = post('search-papers', {'query': 'PX-914', 'folder_ids': [energy]})['papers']
+        self.assertEqual(papers[0]['document_id'], aurora)
+        self.assertTrue(papers[0]['body_previews'][0]['source']['chunk_id'])
+        self.assertEqual(post('search-papers', {'query': 'PX-914', 'document_ids': []})['papers'], [])
 
         hits = post("search", {"query": "PX-914", "document_ids": [aurora]})["candidates"]
         candidate = next(hit for hit in hits if hit["page_index"] == 1)
@@ -358,10 +363,64 @@ class RetrievalIntegrationTest(TestCase):
         self.assertEqual(evidence[1]["version_id"], hashlib.sha256(original).hexdigest())
         self.assertTrue(evidence[1]["rects"])
 
+        import app
+        from literature_tools import LiteratureTools
+        from knowledge_search import KnowledgeScope
+        from openai.types.chat import ChatCompletionMessageFunctionToolCall
+
+        def tool_reply(*calls):
+            return SimpleNamespace(usage=SimpleNamespace(total_tokens=12), choices=[SimpleNamespace(
+                finish_reason='tool_calls', message=SimpleNamespace(content=None, tool_calls=[
+                    ChatCompletionMessageFunctionToolCall(id=f'call_{index}', type='function',
+                        function={'name': name, 'arguments': json.dumps(args)})
+                    for index, (name, args) in enumerate(calls)
+                ]))])
+
+        pinned = LiteratureTools(app.knowledge_search, app.document_profiles, KnowledgeScope(document_ids=[aurora]))
+        self.assertEqual(pinned.execute('read_passages', json.dumps({'chunk_ids': [chunk_id]}))['status'], 'ok')
+        self.assertEqual(pinned.execute('search_papers', '{"query":"test","document_ids":[]}')['code'], 'invalid_arguments')
+        self.assertEqual(pinned.execute('unknown_function', '{}')['code'], 'unknown_tool')
+        self.assertEqual(pinned.execute('read_passages', json.dumps({'chunk_ids': [chunk_id]}))['code'], 'duplicate_call')
+        with patch.dict(os.environ, {'RAG_LITERATURE_TOOLS': '1'}), patch('app.get_deepseek_client') as factory, patch(
+            'app.plan_question', return_value=(QuestionPlan(route='evidence', reading_mode='local'), 5),
+        ), patch('app.ground_answer', side_effect=lambda answer, sources, *args: (answer, sources, 0, {})):
+            factory.return_value.__enter__.return_value = factory.return_value
+            create = factory.return_value.chat.completions.create
+            create.side_effect = [tool_reply(('list_sections', {'document_id': northwind}),
+                                            ('search_passages', {'query': 'PX-914', 'document_id': aurora})),
+                                  tool_reply(('read_passages', {'chunk_ids': [chunk_id]})),
+                                  reply(json.dumps({'chunk_ids': ['not-read', chunk_id]})),
+                                  reply('实验结果为37小时 [1](#evidence-1)')]
+            result = checked(client.post('/api/chat', json={'question': 'PX-914 的持续时长？', 'document_ids': [aurora]}))
+            tools = result['diagnostics']['tools']
+            self.assertEqual(tools['stop'], 'selected')
+            self.assertFalse(tools['fallback'])
+            self.assertIn('not_in_scope', [call.get('code') for call in tools['calls']])
+            self.assertEqual([source['chunk_id'] for source in result['sources']], [chunk_id])
+            self.assertEqual(result['token_usage'], 53)
+            self.assertIn('citation_verification', result['diagnostics']['stages_ms'])
+            self.assertEqual(create.call_args_list[0].kwargs['tool_choice'], 'required')
+            self.assertTrue(any(m['role'] == 'tool' for m in create.call_args_list[1].kwargs['messages']))
+
+        with patch.dict(os.environ, {'RAG_LITERATURE_TOOLS': '1'}), patch('app.get_deepseek_client') as factory, patch(
+            'app.plan_question', return_value=(QuestionPlan(route='evidence', reading_mode='local'), 5),
+        ), patch('app.select_rag_evidence', return_value=([], 4)) as fallback:
+            factory.return_value.__enter__.return_value = factory.return_value
+            factory.return_value.chat.completions.create.return_value = reply('invalid selection')
+            response = client.post('/api/chat?stream=true', json={'question': '局部结果？', 'document_ids': [aurora]})
+            self.assertEqual(response.status_code, 200, response.text)
+            final = [json.loads(line) for line in response.iter_lines()][-1]
+            self.assertTrue(final['diagnostics']['tools']['fallback'])
+            self.assertIn('passage_retrieval', final['diagnostics']['stages_ms'])
+            self.assertEqual(final['token_usage'], 21)
+            fallback.assert_called_once()
+
         replacement = make_pdf("Aurora Protocol revised battery duration to 41 hours.")
         response = client.post(f"/api/documents/{aurora}/versions", files={"file": ("revision.pdf", replacement)})
         checked(response, 202)
         wait_for({aurora})
+        self.assertEqual(pinned.sources(), [])
+        self.assertEqual(pinned.execute('list_sections', json.dumps({'document_id': aurora}))['code'], 'stale_version')
         checked(client.post("/api/knowledge/read", json={"chunk_id": chunk_id}), 404)
         hits = post("search", {"query": "battery duration", "document_ids": [aurora]})["candidates"]
         self.assertEqual(len(hits), 1)

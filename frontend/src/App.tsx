@@ -9,6 +9,7 @@ import { chatStream, listChatThreads, createChatThread, getChatThread, renameCha
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import SectionReader from './components/SectionReader';
 import PaperProfile from './components/PaperProfile';
+import PaperDiscovery from './components/PaperDiscovery';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { citationNumberFromHref, remarkCitationLinks } from './citationLinks';
@@ -1930,6 +1931,18 @@ function App() {
 
                   {/* 文件管理 */}
                   <div className="bg-white dark:bg-slate-800 rounded-xl shadow-md border border-gray-200 dark:border-slate-700 p-3 md:p-4">
+                    <PaperDiscovery folderId={selectedFolder || undefined}
+                      onOpen={async id => {
+                        const available = await getDocuments();
+                        const doc = available.find(item => item.id === id);
+                        if (!doc) throw new Error('文献已移出当前知识库，请重新查找');
+                        await openDocumentInViewer(doc);
+                      }}
+                      onPreview={source => {
+                        setReferenceFile({ id: source.id, filename: source.filename,
+                          versionId: source.version_id, sources: [source], selectionId: ++citationSelection.current });
+                        setActiveTab('ask');
+                      }} />
                     <div className="mb-3 flex flex-col gap-2">
                       <h4 className="flex items-center space-x-2 text-sm font-bold">
                         <Icon icon="solar:file-text-bold-duotone" className="text-brand-600" />

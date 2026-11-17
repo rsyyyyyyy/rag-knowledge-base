@@ -6,9 +6,10 @@ from pydantic import BaseModel, Field
 
 from search_text import exact_document_match, match_expression
 from document_structure import STRUCTURE_VERSION
+from paper_index import PaperIndex
 
 
-RetrievalMode = Literal["hybrid", "vector"]
+RetrievalMode = Literal["multilevel", "hybrid", "vector"]
 RRF_K = 60
 
 
@@ -25,7 +26,7 @@ class KnowledgeScope(BaseModel):
 class KnowledgeSearch(KnowledgeScope):
     query: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=8, ge=1, le=50)
-    retrieval_mode: RetrievalMode = "hybrid"
+    retrieval_mode: RetrievalMode = "multilevel"
 
 
 class PassageRequest(KnowledgeScope):
@@ -56,6 +57,8 @@ class KnowledgeSearchService:
         self.ingestion = ingestion
         self.store = ingestion.store
         self.catalog = self.store.catalog
+        self.profile_config_key = None
+        self.paper_index = PaperIndex(self.catalog, ingestion.embed) if hasattr(ingestion, 'embed') else None
 
     def session(self, scope: KnowledgeScope):
         return KnowledgeReadSession(self, scope)
@@ -144,6 +147,17 @@ class KnowledgeSearchService:
     def search(self, question, scope, limit, mode: RetrievalMode = "hybrid"):
         if not question.strip() or limit <= 0:
             return []
+        if mode == 'multilevel':
+            papers, _ = self.discover(question, scope, min(limit, 50))
+            # One hit per paper first; a long paper cannot consume every candidate slot.
+            output = []
+            for offset in range(limit):
+                for paper in papers:
+                    if offset < len(paper['_hits']):
+                        output.append(paper['_hits'][offset])
+                        if len(output) == limit:
+                            return output
+            return output
         with self.ingestion.index_lock:
             documents = self._documents(scope)
             active = self._active(documents)
@@ -189,11 +203,97 @@ class KnowledgeSearchService:
                 if chunk_id in rows
             ]
 
+    def discover(self, query, scope, limit=8, mode='multilevel'):
+        if not query.strip():
+            return [], []
+        with self.ingestion.index_lock:
+            documents = self._documents(scope)
+            active = self._active(documents)
+            body = self.search(query, scope, min(150, max(30, limit * 6)),
+                               'vector' if mode == 'vector' else 'hybrid')
+            if mode == 'multilevel':
+                represented = {hit['doc_id'] for hit in body}
+                # A shared top-k can be filled by one long paper. Reserve bounded
+                # per-paper body probes independently of whether a card exists.
+                missing = sorted(set(active) - represented)[:20]
+                for doc_id in missing:
+                    body.extend(self.search(query, KnowledgeScope(document_ids=[doc_id]), 2, 'hybrid'))
+            profile, warnings = (self.paper_index.search(query, active, self.profile_config_key, 150)
+                                 if mode == 'multilevel' and self.paper_index else ([], []))
+            by_doc, lane_ranks = {}, {}
+            for hit in body:
+                by_doc.setdefault(hit['doc_id'], {'body': [], 'profile': []})['body'].append(hit)
+                for lane, rank in hit['rank_signals'].items():
+                    key = 'body_' + lane
+                    lane_ranks.setdefault(key, {})[hit['doc_id']] = min(
+                        rank, lane_ranks.get(key, {}).get(hit['doc_id'], rank))
+            with self.catalog.connect() as db:
+                ids = list(dict.fromkeys(e.get('chunk_id') for h in profile for e in h['note']['evidence']
+                                         if e.get('chunk_id')))
+                originals = self._chunks(db, ids)
+            for hit in profile:
+                doc_id = hit['document_id']
+                proof = [e for e in hit['note']['evidence'] if e.get('chunk_id') in originals
+                         and originals[e['chunk_id']]['doc_id'] == doc_id
+                         and originals[e['chunk_id']]['generation'] == active[doc_id][0]
+                         and e.get('document_version_id') == active[doc_id][1]]
+                if not proof:
+                    continue
+                hit = {**hit, 'note': {**hit['note'], 'evidence': proof}}
+                by_doc.setdefault(doc_id, {'body': [], 'profile': []})['profile'].append(hit)
+                for lane, rank in hit['rank_signals'].items():
+                    lane_ranks.setdefault(lane, {})[doc_id] = min(
+                        rank, lane_ranks.get(lane, {}).get(doc_id, rank))
+            # Convert per-note and per-passage ranks into per-paper ranks before fusion.
+            # The strongest hit counts once in each lane, independent of paper length.
+            signals = {doc_id: {} for doc_id in by_doc}
+            for lane, values in lane_ranks.items():
+                for rank, doc_id in enumerate(sorted(values, key=lambda d: (values[d], d)), 1):
+                    signals[doc_id][lane] = rank
+            scores = {doc_id: sum(0.5 / (RRF_K + r) for r in lanes.values())
+                      for doc_id, lanes in signals.items()}
+            ordered = sorted(by_doc, key=lambda doc_id: (
+                not exact_document_match(query, documents[doc_id]), -scores[doc_id], doc_id))[:limit]
+            result = []
+            for rank, doc_id in enumerate(ordered, 1):
+                group = by_doc[doc_id]
+                merged = {hit['id']: {**hit, 'retrieval_origin': ['body']} for hit in group['body']}
+                for hit in group['profile']:
+                    for evidence in hit['note']['evidence']:
+                        chunk_id = evidence['chunk_id']
+                        if chunk_id in merged:
+                            if 'profile' not in merged[chunk_id]['retrieval_origin']:
+                                merged[chunk_id]['retrieval_origin'].append('profile')
+                            continue
+                        merged[chunk_id] = {**originals[chunk_id], 'version_id': active[doc_id][1],
+                            'rank_signals': hit['rank_signals'], 'fusion_score': None,
+                            'distance': None, 'retrieval_origin': ['profile']}
+                # Preserve independent body seeds even when a card is stale or incomplete.
+                body_hits = [merged[h['id']] for h in group['body']]
+                card_hits = [merged[e['chunk_id']] for h in group['profile'][:3] for e in h['note']['evidence']]
+                combined, seen = [], set()
+                for offset in range(max(len(body_hits), len(card_hits))):
+                    for lane in (card_hits, body_hits):
+                        if offset < len(lane) and lane[offset]['id'] not in seen:
+                            seen.add(lane[offset]['id'])
+                            combined.append({**lane[offset], 'paper_rank': rank, 'paper_score': scores[doc_id]})
+                result.append({'document_id': doc_id, 'version_id': active[doc_id][1],
+                    'generation': active[doc_id][0],
+                    'filename': documents[doc_id].get('filename'),
+                    'title': documents[doc_id].get('title') or documents[doc_id].get('filename'),
+                    'rank_signals': signals[doc_id], 'fusion_score': scores[doc_id],
+                    'exact_match': exact_document_match(query, documents[doc_id]),
+                    'matched_notes': [h['note'] for h in group['profile'][:3]],
+                    '_hits': combined})
+            return result, warnings
+
 
 class KnowledgeReadSession:
     def __init__(self, service, scope):
         self.service = service
-        self.scope = KnowledgeScope(**scope.model_dump(include={"document_ids", "folder_ids"}))
+        # HTTP requests are already validated. Internal snapshots can include
+        # more active papers than the limit for an explicit user selection.
+        self.scope = KnowledgeScope.model_construct(**scope.model_dump(include={"document_ids", "folder_ids"}))
         self.evidence = {}
 
     def list_sections(self, document_id, version_id=None):
@@ -309,7 +409,7 @@ class KnowledgeReadSession:
     def overview(self):
         return self.read_documents()
 
-    def search_knowledge(self, query, limit=8, mode: RetrievalMode = "hybrid"):
+    def search_knowledge(self, query, limit=8, mode: RetrievalMode = "multilevel"):
         return [
             {
                 "chunk_id": row["id"], "document_id": row["doc_id"],
@@ -318,9 +418,53 @@ class KnowledgeReadSession:
                 "version_id": row["version_id"],
                 "rank_signals": row["rank_signals"], "fusion_score": row["fusion_score"],
                 "section_id": row.get("section_id"),
+                "paper_rank": row.get("paper_rank"),
+                "retrieval_origin": row.get("retrieval_origin", ["body"]),
             }
             for row in self.service.search(query, self.scope, limit, mode)
         ]
+
+    def search_papers(self, query, limit=8, mode='multilevel'):
+        with self.service.ingestion.index_lock:
+            papers, warnings = self.service.discover(query, self.scope, limit, mode)
+            output = []
+            for paper in papers:
+                hits = paper.pop('_hits')
+                sources = self.read_passages([h['id'] for h in hits[:2]])
+                output.append({**paper, 'body_previews': [
+                    {'text': source['excerpt'][:240], 'source': source} for source in sources]})
+            return {'papers': output, 'warnings': warnings, 'retrieval_mode': mode,
+                    'ranking_note': '按召回排名融合排序，候选仍需核对原文；排序分数不是匹配概率。'}
+
+    def expand_sections(self, chunk_ids, max_passages=20, per_section=6):
+        """Read small sections completely; use a bounded original-order window for long ones."""
+        with self.service.ingestion.index_lock, self.service.catalog.connect() as db:
+            seeds = self.read_passages(chunk_ids[:max_passages])
+            ids = [s['chunk_id'] for s in seeds]
+            visited = set()
+            active = self.service._active(self.service._documents(self.scope))
+            for seed in seeds:
+                section_id = seed.get('section_id')
+                if not section_id or section_id in visited or len(visited) >= 4:
+                    continue
+                visited.add(section_id)
+                generation = active[seed['id']][0]
+                positions = db.execute('''
+                    SELECT s.start_position,s.end_position,p.position FROM document_sections s
+                    JOIN section_passages p ON p.generation=s.generation AND p.chunk_id=?
+                    WHERE s.id=? AND s.generation=?
+                ''', (seed['chunk_id'], section_id, generation)).fetchone()
+                if not positions:
+                    continue
+                start, end, center = positions
+                selected = db.execute('''SELECT chunk_id,position FROM section_passages
+                    WHERE generation=? AND position BETWEEN ? AND ?
+                    ORDER BY abs(position-?),position LIMIT ?''',
+                    (generation, start, end, center, per_section)).fetchall()
+                for chunk_id, _ in sorted(selected, key=lambda r: r[1]):
+                    if chunk_id not in ids and len(ids) < max_passages:
+                        ids.append(chunk_id)
+            return self.read_passages(ids)
 
     def read_passages(self, chunk_ids, adjacent=0):
         if not chunk_ids:

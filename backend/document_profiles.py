@@ -106,6 +106,7 @@ class DocumentProfiles:
                        "verify_prompt": VERIFY_PROMPT,
                        "batch_budget": 24000, "temperature": 0, "max_tokens": 6000}
         self.config_key = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()
+        search.profile_config_key = self.config_key
         self.wake = Event()
         self.stopping = Event()
         self.worker = None

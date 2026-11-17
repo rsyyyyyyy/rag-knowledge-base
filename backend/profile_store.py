@@ -2,6 +2,7 @@
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
+from paper_index import initialize_paper_search, replace_profile_search
 
 
 def initialize_profiles(db):
@@ -20,6 +21,7 @@ def initialize_profiles(db):
             ON profile_jobs(doc_id) WHERE state IN ('queued', 'processing')""",
     ]:
         db.execute(statement)
+    initialize_paper_search(db)
 
 
 class ProfileStore:
@@ -127,6 +129,7 @@ class ProfileStore:
                   json.dumps(content, ensure_ascii=False), now))
             db.execute("UPDATE profile_jobs SET state=?, updated_at=? WHERE id=?",
                        ("partial" if content["partial"] else "ready", now, job["id"]))
+            replace_profile_search(db, job['doc_id'], job['generation'], job['config_key'], content)
             return True
 
     def fail(self, job_id, error):

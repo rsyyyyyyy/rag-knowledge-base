@@ -41,12 +41,13 @@ def match_expression(query: str) -> str:
 
 def exact_document_match(query: str, metadata: dict) -> bool:
     query = normalized(query)
-    title = metadata.get("title") or Path(metadata.get("filename", "")).stem
-    title = " ".join(normalized(title).split())
+    filename = metadata.get("filename") or ""
+    titles = {" ".join(normalized(value).split()) for value in
+              [metadata.get("title") or "", filename, Path(filename).stem] if value}
     dois = {match.group().rstrip(".;:)") for match in DOI.finditer(query)}
     doi = DOI.search(normalized(metadata.get("doi") or ""))
     return bool(
         (doi and doi.group().rstrip(".;:)") in dois)
-        or (title and query.strip() == title)
-        or (len(title) >= 4 and re.search(r"(?<![a-z0-9])" + re.escape(title) + r"(?![a-z0-9])", query))
+        or any(query.strip() == title or (len(title) >= 4 and re.search(
+            r"(?<![a-z0-9])" + re.escape(title) + r"(?![a-z0-9])", query)) for title in titles)
     )

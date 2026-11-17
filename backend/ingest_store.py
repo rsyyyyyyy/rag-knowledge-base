@@ -298,6 +298,7 @@ class IngestStore:
                 db.execute("DELETE FROM document_sections WHERE doc_id = ?", (doc_id,))
                 db.execute("DELETE FROM section_index_versions WHERE doc_id = ?", (doc_id,))
                 db.execute("DELETE FROM document_profiles WHERE doc_id = ?", (doc_id,))
+                db.execute("DELETE FROM profile_search WHERE doc_id = ?", (doc_id,))
                 db.execute("DELETE FROM profile_jobs WHERE doc_id = ?", (doc_id,))
                 paths.update(row[0] for row in db.execute(
                     "SELECT path FROM document_versions WHERE doc_id = ?", (doc_id,),

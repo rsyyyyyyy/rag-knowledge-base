@@ -288,6 +288,36 @@ export interface Source {
   sourceUrl?: string;
 }
 
+export interface PaperMatch {
+  relevance?: 'direct' | 'possible';
+  document_id: string;
+  version_id: string;
+  filename: string;
+  title: string;
+  rank_signals: Record<string, number>;
+  matched_notes: ProfileNote[];
+  body_previews: { text: string; source: Source }[];
+}
+
+export interface PaperSearchResult {
+  papers: PaperMatch[];
+  warnings: string[];
+  ranking_note: string;
+}
+
+export async function discoverPapers(query: string, folderId: string | undefined, signal: AbortSignal): Promise<PaperSearchResult> {
+  const response = await fetch(`${API_BASE_URL}/knowledge/search-papers`, {
+    method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, top_k: 5, retrieval_mode: 'multilevel',
+      ...(folderId ? { folder_ids: [folderId] } : {}) }),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(typeof detail.detail === 'string' ? detail.detail : '查找文献失败，请重试');
+  }
+  return response.json();
+}
+
 // 问答响应类型
 export interface ChatResponse {
   answer: string;

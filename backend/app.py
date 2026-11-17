@@ -52,6 +52,8 @@ from metadata_enrichment import build_metadata_updates, normalize_doi
 from outline import outline_for_document
 from annotations import AnnotationStore
 from document_profiles import DocumentProfiles
+from paper_reranking import rerank_papers
+from literature_tools import LiteratureTools, collect_tool_evidence
 
 DEEPSEEK_MODEL = "deepseek-flash"
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -341,7 +343,7 @@ class QueryRequest(KnowledgeScope):
     question: str
     thread_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     top_k: int = Field(default=20, ge=1, le=50)
-    retrieval_mode: RetrievalMode = 'hybrid'
+    retrieval_mode: RetrievalMode = 'multilevel'
     rag_enabled: bool = True
     attachment_text: str | None = None
     attachment_filename: str | None = None
@@ -1042,6 +1044,28 @@ def search_knowledge(request: KnowledgeSearch):
     return {"candidates": session.search_knowledge(request.query, request.top_k, request.retrieval_mode)}
 
 
+@app.post("/api/knowledge/search-papers")
+def search_papers(request: KnowledgeSearch):
+    result = knowledge_search.session(request).search_papers(
+        request.query, min(12, max(request.top_k, 8)), request.retrieval_mode)
+    result['reranking'] = 'not_needed'
+    if request.retrieval_mode == 'multilevel' and result['papers']:
+        if os.getenv('DEEPSEEK_API_KEY', '').strip():
+            try:
+                with get_deepseek_client() as deepseek:
+                    result['papers'], tokens = rerank_papers(
+                        request.query, result['papers'], deepseek, DEEPSEEK_MODEL, request.top_k)
+                result.update(reranking='model_reviewed', token_usage=tokens)
+            except (APIError, ValueError):
+                result['reranking'] = 'fallback'
+                result['warnings'].append('相关性复核暂不可用，当前显示未经复核的召回候选，请核对原文。')
+        else:
+            result['reranking'] = 'fallback'
+            result['warnings'].append('未配置模型，当前显示未经复核的召回候选，请核对原文。')
+    result['papers'] = result['papers'][:request.top_k]
+    return result
+
+
 @app.post("/api/knowledge/read")
 def read_knowledge(request: PassageRequest):
     excerpts = knowledge_search.session(request).read_passage(request.chunk_id, request.adjacent)
@@ -1130,9 +1154,10 @@ def select_rag_evidence(request: QueryRequest, retrieval_queries=()) -> tuple[li
         if candidates:
             # Expand the most relevant hits regardless of question keywords.
             body_seeds = [entry["chunk_id"] for entry in candidates][:4]
-            neighbors = session.read_passages(body_seeds, adjacent=1)
+            neighbors = (session.expand_sections(ids, max_passages=24) if request.retrieval_mode == 'multilevel'
+                         else session.read_passages(body_seeds, adjacent=1))
             by_id = {entry["chunk_id"]: entry for entry in [*candidates, *neighbors]}
-            candidates = sorted(by_id.values(), key=overview_material)[:20]
+            candidates = sorted(by_id.values(), key=overview_material)[:24 if request.retrieval_mode == 'multilevel' else 20]
     if not candidates:
         return [], 0
 
@@ -1229,13 +1254,15 @@ def select_rag_evidence(request: QueryRequest, retrieval_queries=()) -> tuple[li
     return list(by_id.values()), token_usage
 
 
-def local_chat_reply(answer, stream, route, token_usage):
+def local_chat_reply(answer, stream, route, token_usage, diagnostics=None):
     if stream:
         return StreamingResponse(iter((
             json.dumps({"type": "text", "content": answer}) + "\n",
-            json.dumps({"type": "end", "token_usage": token_usage, "route": route}) + "\n",
+            json.dumps({"type": "end", "token_usage": token_usage, "route": route,
+                        "diagnostics": diagnostics}) + "\n",
         )), media_type="application/x-ndjson")
-    return {"answer": answer, "sources": [], "model_used": "local-catalog", "token_usage": token_usage, "route": route}
+    return {"answer": answer, "sources": [], "model_used": "local-catalog", "token_usage": token_usage,
+            "route": route, "diagnostics": diagnostics}
 
 
 @app.get("/api/chat/threads")
@@ -1331,6 +1358,16 @@ async def chat(
 
 def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
     try:
+        started = time.perf_counter()
+        timings = {}
+        tool_report = None
+
+        def elapsed(start):
+            return round((time.perf_counter() - start) * 1000)
+
+        def diagnostics():
+            return {"stages_ms": {**timings, "total": elapsed(started)}, "tools": tool_report}
+
         route = "general"
         planning_tokens = 0
         evidence_tokens = 0
@@ -1364,9 +1401,10 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
 
         def catalog_reply(answer):
             save_turn(answer)
-            return local_chat_reply(answer, stream, route, planning_tokens)
+            return local_chat_reply(answer, stream, route, planning_tokens, diagnostics())
 
         if rag_enabled:
+            planning_started = time.perf_counter()
             try:
                 with get_deepseek_client() as deepseek:
                     docs = {doc["id"]: doc["metadata"]["filename"] for doc in load_documents_meta()} if history else {}
@@ -1387,6 +1425,7 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                     plan, planning_tokens = plan_question(
                         deepseek, DEEPSEEK_MODEL, original_question, planner_history, snapshot,
                     )
+                timings['routing'] = elapsed(planning_started)
             except APIError as error:
                 raise deepseek_error(error) from error
             except ValueError as error:
@@ -1456,7 +1495,9 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                         ))
                     )
                     if full_reading:
+                        reading_started = time.perf_counter()
                         sources, covered, total, searchable = knowledge_search.session(request).read_documents()
+                        timings['read_originals'] = elapsed(reading_started)
                         if not sources:
                             catalog_context = f"当前范围共收录 {total} 篇文献，目前没有可用于综述的已索引正文。"
                             if not attached:
@@ -1465,10 +1506,27 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                             notice = "部分文献尚未解析完成，以下回答依据当前可读取的文献。\n\n"
                 if route == "evidence" and not full_reading:
                     evidence_request = request.model_copy(update={"question": resolved_question})
-                    if plan.retrieval_queries:
-                        sources, evidence_tokens = select_rag_evidence(evidence_request, plan.retrieval_queries)
-                    else:
-                        sources, evidence_tokens = select_rag_evidence(evidence_request)
+                    if request.retrieval_mode == 'multilevel' and os.getenv('RAG_LITERATURE_TOOLS', '1') != '0':
+                        tool_started = time.perf_counter()
+                        registry = LiteratureTools(knowledge_search, document_profiles, request)
+                        if registry.active:
+                            with get_deepseek_client() as tool_client:
+                                sources, evidence_tokens, stop = collect_tool_evidence(
+                                    tool_client, DEEPSEEK_MODEL, registry, resolved_question,
+                                    plan.retrieval_queries,
+                                )
+                        else:
+                            stop = 'empty_scope'
+                        timings['literature_tools'] = elapsed(tool_started)
+                        tool_report = {'stop': stop, 'fallback': not sources, 'calls': registry.trace}
+                    if not sources:
+                        fallback_started = time.perf_counter()
+                        if plan.retrieval_queries:
+                            sources, fallback_tokens = select_rag_evidence(evidence_request, plan.retrieval_queries)
+                        else:
+                            sources, fallback_tokens = select_rag_evidence(evidence_request)
+                        evidence_tokens += fallback_tokens
+                        timings['passage_retrieval'] = elapsed(fallback_started)
         if rag_enabled and route in {"overview", "evidence"} and sources:
             if request.document_ids is None:
                 actual = list(dict.fromkeys(source["id"] for source in sources if source["id"] != "attachment"))
@@ -1484,12 +1542,14 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
         if route in {"overview", "evidence"}:
             sources = [{**source, "citation_number": number} for number, source in enumerate(sources, 1)]
         if full_reading and sources:
+            reading_started = time.perf_counter()
             try:
                 with get_deepseek_client() as reader:
                     context, reading_tokens, reading_report = prepare_full_context(
                         sources, resolved_question, reader, DEEPSEEK_MODEL,
                     )
                 retrieval_tokens += reading_tokens
+                timings['prepare_full_context'] = elapsed(reading_started)
                 if reading_report["partial"]:
                     notice += "以下总结基于本轮能核验的原文，部分细节可能未覆盖。\n\n"
             except APIError as error:
@@ -1524,7 +1584,7 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                 "可以把问题缩小到论文的具体章节或单个实验指标后重试。"
             )
             save_turn(answer)
-            return local_chat_reply(answer, stream, route, retrieval_tokens)
+            return local_chat_reply(answer, stream, route, retrieval_tokens, diagnostics())
 
         if route == 'evidence' and not has_rag_context:
             notice = (
@@ -1608,6 +1668,7 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
             ])
         messages.append({"role": "user", "content": user_message})
 
+        generation_started = time.perf_counter()
         deepseek = get_deepseek_client()
         try:
             response = deepseek.chat.completions.create(
@@ -1670,13 +1731,16 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                 finally:
                     deepseek.close()
                 answer = "".join(answer_parts)
+                timings['answer_generation'] = elapsed(generation_started)
                 if not answer.strip():
                     yield json.dumps({"type": "error", "message": "DeepSeek 未返回有效回答，请重试"}) + "\n"
                     return
                 try:
                     if rag_enabled and any(source.get("citation_number") for source in sources):
                         yield json.dumps({"type": "verifying_citations"}) + "\n"
+                    verification_started = time.perf_counter()
                     answer, sources, audit_tokens, grounding_report = verify_final(answer)
+                    timings['citation_verification'] = elapsed(verification_started)
                     token_usage += audit_tokens
                     yield json.dumps({"type": "answer", "content": notice + answer}) + "\n"
                 except Exception as error:
@@ -1691,15 +1755,20 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
                     return
                 if sources:
                     yield json.dumps({"type": "sources", "sources": sources}) + "\n"
-                yield json.dumps({"type": "end", "token_usage": token_usage, "route": route, "reading": reading_report, "grounding": grounding_report}) + "\n"
+                yield json.dumps({"type": "end", "token_usage": token_usage, "route": route,
+                                  "reading": reading_report, "grounding": grounding_report,
+                                  "diagnostics": diagnostics()}) + "\n"
 
             return StreamingResponse(generate(), media_type="application/x-ndjson")
 
         deepseek.close()
+        timings['answer_generation'] = elapsed(generation_started)
         answer = response.choices[0].message.content if response.choices else None
         if not answer:
             raise HTTPException(status_code=502, detail="DeepSeek 未返回有效回答，请重试")
+        verification_started = time.perf_counter()
         answer, sources, audit_tokens, grounding_report = verify_final(answer)
+        timings['citation_verification'] = elapsed(verification_started)
         retrieval_tokens += audit_tokens
         save_turn(notice + answer)
         return {
@@ -1709,6 +1778,7 @@ def chat_response(request: QueryRequest, rag_enabled: bool, stream: bool):
             "model_used": DEEPSEEK_MODEL,
             "reading": reading_report,
             "route": route,
+            "diagnostics": diagnostics(),
             "token_usage": retrieval_tokens + (response.usage.total_tokens if response.usage else 0),
         }
     except HTTPException:
