@@ -214,11 +214,14 @@ export function ReferencePanel({ file, onClose }: { file: ReferenceFile; onClose
 
 export default function ReferenceSources({
   sources,
+  answer,
   onSelect,
 }: {
   sources: Source[];
+  answer: string;
   onSelect: (file: ReferenceFile) => void;
 }) {
+  const citedNumbers = new Set(Array.from(answer.matchAll(/\[\d+\]\(#evidence-(\d+)\)/g), match => Number(match[1])));
   const files = new Map<string, ReferenceFile>();
   for (const source of sources) {
     const key = source.version_id ? source.id + ':' + source.version_id : source.id;
@@ -233,8 +236,8 @@ export default function ReferenceSources({
     <div className="space-y-2">
       <p className="text-xs font-semibold text-gray-500 dark:text-slate-400">参考原文</p>
       {Array.from(files, ([key, file]) => (
+        <div key={key} className="space-y-1">
         <button
-          key={key}
           type="button"
           onClick={() => onSelect(file)}
           className="flex w-full items-center justify-between gap-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-left text-xs hover:bg-brand-50 dark:border-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700"
@@ -242,6 +245,17 @@ export default function ReferenceSources({
           <span className="break-all font-medium">{file.filename}</span>
           <span className="shrink-0 text-gray-500 dark:text-slate-400">{file.sources.length} 个片段</span>
         </button>
+        <div className="flex flex-wrap gap-1.5" aria-label="原文证据编号">
+          {file.sources.map(source => source.citation_number !== undefined && (
+            <button key={source.citation_number} type="button"
+              className="rounded border border-gray-300 px-2 py-1 text-xs hover:border-brand-500 dark:border-slate-700"
+              onClick={() => onSelect({ ...file, sources: [source] })}>
+              [{source.citation_number}] {source.page_index === undefined ? '' : `第 ${source.page_index + 1} 页 · `}
+              {citedNumbers.has(source.citation_number) ? '正文已引用' : '可查看片段'}
+            </button>
+          ))}
+        </div>
+        </div>
       ))}
     </div>
   );

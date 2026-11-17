@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
-import { Modal, Input, Select, message } from 'antd';
-import type { Source } from './services/api';
+import { Modal, Input, Select, Tooltip, message } from 'antd';
+import type { ChatThread, ChatTurn, Source } from './services/api';
 import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/OnlinePaperSearch';
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
-import { chatStream, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
+import { chatStream, listChatThreads, createChatThread, getChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -35,6 +35,14 @@ interface Message {
   content: string;
   sources?: Source[];
   complete?: boolean; // 标记消息是否完成
+}
+
+function chatMessages(turns: ChatTurn[]): Message[] {
+  return turns.flatMap(turn => [
+    { role: 'user', content: turn.attachment_filename
+      ? `${turn.question}\n📎 附件：${turn.attachment_filename}` : turn.question },
+    { role: 'assistant', content: turn.answer, sources: turn.sources, complete: true },
+  ]);
 }
 
 interface Document {
@@ -92,12 +100,15 @@ function App() {
   const [inputValue, setInputValue] = useState('');
   const [showCommandHint, setShowCommandHint] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [tokenUsage, setTokenUsage] = useState(0);
   const [ragEnabled, setRagEnabled] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [chatAttachment, setChatAttachment] = useState<{
-    filename: string; text: string; basis?: OnlinePaperAttachment['basis']; sourceUrl?: string;
+    filename: string; text: string; basis?: OnlinePaperAttachment['basis']; sourceUrl?: string; inLibrary?: boolean;
   } | null>(null);
   const [onlinePaperSearchOpen, setOnlinePaperSearchOpen] = useState(false);
   const [showAttachmentChoice, setShowAttachmentChoice] = useState(false);
@@ -884,9 +895,86 @@ function App() {
     e.target.style.height = `${e.target.scrollHeight}px`;
   };
 
+  useEffect(() => {
+    let active = true;
+    async function restoreHistory() {
+      try {
+        const { threads } = await listChatThreads();
+        if (!active) return;
+        setChatThreads(threads);
+        const latest = threads[0];
+        if (!latest) return;
+        const { turns } = await getChatThread(latest.id);
+        if (active) {
+          setThreadId(latest.id);
+          setMessages(chatMessages(turns));
+        }
+      } catch {
+        if (active) message.error('无法加载历史对话，请检查后端服务。');
+      } finally {
+        if (active) setHistoryLoading(false);
+      }
+    }
+    void restoreHistory();
+    return () => { active = false; };
+  }, []);
+
+  const switchChatThread = async (id: string | null) => {
+    if (historyLoading || isLoading || chatInFlightRef.current) return;
+    setHistoryLoading(true);
+    try {
+      const turns = id ? (await getChatThread(id)).turns : [];
+      followChatRef.current = true;
+      setThreadId(id);
+      setMessages(chatMessages(turns));
+      setInputValue('');
+      setShowCommandHint(false);
+      setChatAttachment(null);
+      setPendingAttachmentFile(null);
+      setShowAttachmentChoice(false);
+      setReferenceFile(null);
+      setRagEnabled(true);
+      setActiveTab('ask');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '无法打开历史对话。');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const prepareChatAttachment = async (file: File, addToLibrary: boolean) => {
+    if (chatInFlightRef.current || isLoading || historyLoading) return;
+    setShowAttachmentChoice(false);
+    setPendingAttachmentFile(null);
+    setIsLoading(true);
+    try {
+      const [parsed, uploaded] = await Promise.allSettled([
+        parseFileOnly(file),
+        addToLibrary ? uploadDocument(file) : Promise.resolve(null),
+      ]);
+      const inLibrary = uploaded.status === 'fulfilled' && uploaded.value !== null;
+      if (parsed.status === 'fulfilled' && parsed.value.text.trim()) {
+        setChatAttachment({ filename: parsed.value.filename, text: parsed.value.text, inLibrary });
+        message.success(inLibrary ? '已加入知识库，附件也已就绪。' : '附件已就绪，将用于下一条消息。');
+      } else {
+        message.warning(inLibrary ? '文件已加入知识库，但未能提取文本作为对话附件。'
+          : '未能提取附件文本，请检查文件或使用带文字层的 PDF。');
+      }
+      if (uploaded.status === 'rejected') {
+        const reason = uploaded.reason instanceof Error ? uploaded.reason.message : '请稍后重试。';
+        message.error(`加入知识库失败：${reason}`);
+      }
+      if (inLibrary) {
+        void getDocuments().then(setDocuments).catch(() => {});
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const sendQuestion = async (text: string) => {
     const question = text.trim();
-    if (!question || isLoading || chatInFlightRef.current) return;
+    if (!question || isLoading || historyLoading || chatInFlightRef.current) return;
 
     chatInFlightRef.current = true;
     followChatRef.current = true;
@@ -905,6 +993,8 @@ function App() {
     ]);
 
     try {
+      const id = threadId ?? (await createChatThread()).id;
+      setThreadId(id);
       await chatStream(
         question,
         20,
@@ -922,10 +1012,17 @@ function App() {
             reply.id === replyId ? { ...reply, complete: true, sources: linkedSources } : reply
           ));
           setTokenUsage(previous => previous + tokenUsage);
+          setChatThreads(previous => {
+            const thread = previous.find(item => item.id === id)
+              ?? { id, title: question.replace(/\s+/g, ' ').slice(0, 60) };
+            return [thread, ...previous.filter(item => item.id !== id)];
+          });
         },
         attachment?.text,
         attachment?.filename,
         attachment?.basis,
+        id,
+        attachment?.sourceUrl,
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : '问答请求失败，请稍后重试。';
@@ -1042,6 +1139,27 @@ function App() {
                 <span className="font-medium">创作中心</span>
               </button>
             </div>
+
+            {activeTab === 'ask' && (
+              <section aria-label="历史对话" className="space-y-2">
+                <div className="flex items-center justify-between px-2">
+                  <h2 className="text-xs font-semibold text-gray-500 dark:text-slate-400">历史对话</h2>
+                  <button type="button" disabled={isLoading || historyLoading} onClick={() => void switchChatThread(null)}
+                    className="rounded px-2 py-1 text-xs font-semibold text-brand-600 hover:bg-brand-50 disabled:opacity-50">
+                    ＋ 新会话
+                  </button>
+                </div>
+                {chatThreads.map(thread => (
+                  <button key={thread.id} type="button" title={thread.title}
+                    aria-current={thread.id === threadId ? 'true' : undefined}
+                    disabled={isLoading || historyLoading}
+                    onClick={() => void switchChatThread(thread.id)}
+                    className="block w-full truncate rounded-lg px-3 py-2 text-left text-xs hover:bg-gray-100 aria-current:bg-brand-100 dark:hover:bg-slate-800 dark:aria-current:bg-slate-800">
+                    {thread.title}
+                  </button>
+                ))}
+              </section>
+            )}
 
             {/* 最近访问 */}
             <div className="pt-6">
@@ -1170,7 +1288,8 @@ function App() {
                           )}
                         </div>
                         {message.role === 'assistant' && !!message.sources?.length && (
-                          <ReferenceSources sources={message.sources} onSelect={setReferenceFile} />
+                          <ReferenceSources sources={message.sources} answer={message.content}
+                            onSelect={file => setReferenceFile({ ...file, selectionId: ++citationSelection.current })} />
                         )}
                       </div>
                       {message.role === 'user' && (
@@ -1219,8 +1338,12 @@ function App() {
                   </div>
 
                   <div className="relative flex items-end bg-white dark:bg-slate-800 border-2 border-brand-100 dark:border-slate-700 focus-within:border-brand-500 shadow-xl rounded-2xl transition-all p-2">
+                    <Tooltip title="添加附件" trigger={['hover', 'focus']}>
                     <button
-                      className="p-2 text-gray-400 hover:text-brand-600 transition-colors"
+                      type="button"
+                      aria-label="添加附件"
+                      disabled={isLoading || historyLoading}
+                      className="p-2 text-gray-400 hover:text-brand-600 transition-colors disabled:opacity-50"
                       onClick={() => {
                         const fileInput = document.createElement('input');
                         fileInput.type = 'file';
@@ -1237,11 +1360,14 @@ function App() {
                     >
                       <Icon icon="solar:paperclip-line-duotone" className="text-2xl" />
                     </button>
-                    <button type="button" title="联网找论文" aria-label="联网找论文" disabled={isLoading}
-                      className="shrink-0 p-2 text-gray-500 transition-colors hover:text-brand-600 disabled:opacity-50"
-                      onClick={() => setOnlinePaperSearchOpen(true)}>
-                      <Icon icon="solar:global-line-duotone" className="text-xl" />
-                    </button>
+                    </Tooltip>
+                    <Tooltip title="联网找论文" trigger={['hover', 'focus']}>
+                      <button type="button" aria-label="联网找论文" disabled={isLoading}
+                        className="shrink-0 p-2 text-gray-500 transition-colors hover:text-brand-600 disabled:opacity-50"
+                        onClick={() => setOnlinePaperSearchOpen(true)}>
+                        <Icon icon="solar:global-line-duotone" className="text-xl" />
+                      </button>
+                    </Tooltip>
                     <textarea
                       ref={textareaRef}
                       className="w-full bg-transparent border-none focus:ring-0 text-sm py-2.5 max-h-32 hide-scrollbar resize-none font-medium"
@@ -1267,7 +1393,7 @@ function App() {
                       <button
                         className="p-2 bg-brand-600 text-white rounded-xl shadow-lg shadow-brand-200 hover:bg-brand-700 transition-all group transform hover:scale-105"
                         aria-label="发送消息"
-                        disabled={isLoading || !inputValue.trim()}
+                        disabled={isLoading || historyLoading || !inputValue.trim()}
                         onClick={() => void sendQuestion(inputValue)}
                       >
                         <Icon icon="solar:send-bold" className="text-xl group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
@@ -1280,7 +1406,7 @@ function App() {
                         <Icon icon="solar:document-text-bold" className="text-brand-600 shrink-0" />
                         <span className="text-xs text-brand-700 dark:text-brand-300 truncate">📎 {chatAttachment.filename}</span>
                         <span className="text-[10px] text-gray-500 shrink-0">
-                          {chatAttachment.basis === 'pdf' ? '开放 PDF' : chatAttachment.basis === 'abstract' ? '仅摘要' : '仅作为附件'}
+                          {chatAttachment.inLibrary ? '已入库 · 随消息发送' : chatAttachment.basis === 'pdf' ? '开放 PDF' : chatAttachment.basis === 'abstract' ? '仅摘要' : '仅作为附件'}
                         </span>
                         {chatAttachment.sourceUrl && <a href={chatAttachment.sourceUrl} target="_blank" rel="noreferrer"
                           className="shrink-0 text-xs text-brand-600 underline">来源</a>}
@@ -1319,52 +1445,17 @@ function App() {
                         <div className="space-y-2">
                           <button
                             className="w-full flex items-center space-x-3 p-3 border-2 border-brand-200 rounded-xl hover:bg-brand-50 hover:border-brand-400 transition-all"
-                            onClick={async () => {
-                              const file = pendingAttachmentFile;
-                              setShowAttachmentChoice(false);
-                              setPendingAttachmentFile(null);
-                              setIsLoading(true);
-                              try {
-                                const uploadRes = await uploadDocument(file);
-                                const realSize = uploadRes.document?.metadata?.size ?? file.size;
-                                if (uploadRes.duplicate) message.info('此文件已在知识库中。');
-                                else message.success('文件已上传（' + formatFileSize(realSize) + '），已加入入库队列。');
-                                const docs = await getDocuments();
-                                setDocuments(docs);
-                              } catch (error) {
-                                message.error(`上传失败：${error instanceof Error ? error.message : '未知错误'}`);
-                              } finally {
-                                setIsLoading(false);
-                              }
-                            }}
+                            onClick={() => void prepareChatAttachment(pendingAttachmentFile, true)}
                           >
                             <Icon icon="solar:database-bold-duotone" className="text-2xl text-brand-600" />
                             <div className="text-left">
                               <p className="text-sm font-semibold text-brand-700">加入知识库</p>
-                              <p className="text-xs text-gray-500">文件将永久存储在知识库中，后续 RAG 检索可使用</p>
+                              <p className="text-xs text-gray-500">保存到知识库，同时作为附件随下一条消息发送</p>
                             </div>
                           </button>
                           <button
                             className="w-full flex items-center space-x-3 p-3 border-2 border-gray-200 rounded-xl hover:bg-gray-50 hover:border-gray-400 transition-all"
-                            onClick={async () => {
-                              const file = pendingAttachmentFile;
-                              setShowAttachmentChoice(false);
-                              setPendingAttachmentFile(null);
-                              setIsLoading(true);
-                              try {
-                                const result = await parseFileOnly(file);
-                                if (!result.text) {
-                                  message.warning(`无法从 "${file.name}" 提取文本内容`);
-                                  return;
-                                }
-                                setChatAttachment({ filename: result.filename, text: result.text });
-                                message.success(`附件 "${file.name}" 已就绪，发送消息时将作为上下文提供给 AI`);
-                              } catch (error) {
-                                message.error(`解析失败：${error instanceof Error ? error.message : '未知错误'}`);
-                              } finally {
-                                setIsLoading(false);
-                              }
-                            }}
+                            onClick={() => void prepareChatAttachment(pendingAttachmentFile, false)}
                           >
                             <Icon icon="solar:paperclip-line-duotone" className="text-2xl text-gray-600" />
                             <div className="text-left">

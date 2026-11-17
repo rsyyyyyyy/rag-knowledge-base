@@ -188,6 +188,8 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
     const pageIndex = source.page_index;
     return pageIndex !== undefined && highlights.has(pageIndex) ? [{
       index, pageIndex, top: source.rects?.[0]?.[1] ?? 0,
+      number: source.citation_number,
+      precision: !source.rects?.length ? '仅页码' : source.citation_precision === 'fragment' ? '片段高亮' : '原文高亮',
     }] : [];
   }).sort((a, b) => a.pageIndex - b.pageIndex || a.top - b.top);
   const firstEvidencePage = evidence[0]?.pageIndex;
@@ -307,10 +309,10 @@ export default function PdfReferencePreview({ url, sources, onError, onNavigatio
         {evidence.length > 0 && (
           <div className="flex max-h-24 flex-wrap items-center gap-2 overflow-auto" aria-label="引用片段">
             <span className="text-xs text-gray-500 dark:text-slate-400">跳转到命中片段：</span>
-            {evidence.map(({ index, pageIndex, top }) => (
+            {evidence.map(({ index, pageIndex, top, number, precision }) => (
               <button key={index} type="button" onClick={() => jumpToEvidence(scroller, pageIndex, top)}
                 className="rounded border border-yellow-500 px-2 py-1 hover:bg-yellow-100 hover:text-slate-950">
-                第 {pageIndex + 1} 页 · 片段 {index + 1}
+                {number === undefined ? `片段 ${index + 1}` : `[${number}]`} · 第 {pageIndex + 1} 页 · {precision}
               </button>
             ))}
           </div>

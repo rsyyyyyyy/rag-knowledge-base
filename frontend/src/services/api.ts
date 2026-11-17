@@ -61,6 +61,7 @@ export interface RetrievedDocument extends Document {
 export interface Source {
   evidence_id?: string;
   citation_number?: number;
+  citation_precision?: 'fragment' | 'page';
   document_version_id?: string;
   version_id?: string;
   page_index?: number;
@@ -248,6 +249,31 @@ export async function downloadOnlinePaper(paper: OnlinePaper): Promise<File> {
   return new File([await response.blob()], filename, { type: 'application/pdf' });
 }
 
+export interface ChatThread {
+  id: string;
+  title: string;
+}
+
+export interface ChatTurn {
+  question: string;
+  answer: string;
+  attachment_filename?: string | null;
+  sources: Source[];
+}
+
+async function requestChatHistory<T>(path: string, method = 'GET'): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}/chat/threads${path}`, { method });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(typeof error.detail === 'string' ? error.detail : '无法读取或保存会话。');
+  }
+  return response.json() as Promise<T>;
+}
+
+export const listChatThreads = () => requestChatHistory<{ threads: ChatThread[] }>('');
+export const createChatThread = () => requestChatHistory<{ id: string }>('', 'POST');
+export const getChatThread = (id: string) => requestChatHistory<{ turns: ChatTurn[] }>(`/${encodeURIComponent(id)}`);
+
 export const chatStream = async (
   question: string,
   top_k: number = 3,
@@ -257,9 +283,13 @@ export const chatStream = async (
   attachmentText?: string,
   attachmentFilename?: string,
   attachmentBasis?: 'pdf' | 'abstract',
+  threadId?: string,
+  attachmentSourceUrl?: string,
 ): Promise<void> => {
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
+  if (threadId) body.thread_id = threadId;
   if (attachmentBasis) body.attachment_basis = attachmentBasis;
+  if (attachmentSourceUrl) body.attachment_source_url = attachmentSourceUrl;
   if (attachmentText) body.attachment_text = attachmentText;
   if (attachmentFilename) body.attachment_filename = attachmentFilename;
 
