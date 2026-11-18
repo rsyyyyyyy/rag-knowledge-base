@@ -66,7 +66,7 @@ class EvidenceGroundingTest(TestCase):
                                                'duration?',client,'test')
             self.assertEqual(sources,[])
             self.assertNotIn('#evidence-',text)
-            self.assertIn('依据不足',text)
+            self.assertEqual(text, '')
             self.assertNotIn('99 hours',text)
             self.assertEqual(audit['verified'],0)
 
@@ -130,7 +130,7 @@ class EvidenceGroundingTest(TestCase):
         ])
         answer = '电池持续 99 小时 [8](#evidence-8)。\n\n电池持续 88 小时 [8](#evidence-8)。'
         text, sources, _, _ = ground_answer(answer, [passage()], 'duration?', client, 'test')
-        self.assertEqual(text.strip(), '该项结论的原文依据不足。')
+        self.assertEqual(text, '')
         self.assertEqual(sources, [])
 
     def test_reused_number_is_checked_separately_for_different_assertions(self):
@@ -142,7 +142,8 @@ class EvidenceGroundingTest(TestCase):
                                            [passage()],'duration?',client,'test')
         self.assertEqual(len(sources),1)
         self.assertEqual(text.count('#evidence-'),1)
-        self.assertIn('依据不足',text)
+        self.assertNotIn('依据不足',text)
+        self.assertNotIn('99 hours',text)
         self.assertEqual(audit['verified'],1)
 
     def test_redundant_unsupported_reference_does_not_discredit_verified_claim(self):
@@ -158,6 +159,15 @@ class EvidenceGroundingTest(TestCase):
         self.assertIn('37 hours',text)
         self.assertNotIn('依据不足',text)
         self.assertEqual(text.count('#evidence-'),1)
+
+    def test_unknown_citation_omits_the_claim_and_marker(self):
+        client = Mock()
+        text, sources, _, audit = ground_answer('- 该实验持续 99 小时 [9](#evidence-9)。',
+                                                [passage()], 'duration?', client, 'test')
+        self.assertEqual(text, '')
+        self.assertEqual(sources, [])
+        self.assertEqual(audit['unsupported'], 1)
+        client.chat.completions.create.assert_not_called()
 
     def test_repair_cannot_silently_change_document_or_version(self):
         for changed in ({'id':'different-paper'}, {'version_id':'v2','document_version_id':'v2'}):

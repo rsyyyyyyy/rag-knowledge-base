@@ -2,10 +2,10 @@ import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from
 import { renderAsync } from 'docx-preview';
 import { Icon } from '@iconify/react';
 import { Modal, Input, Select, Tooltip, Dropdown, message } from 'antd';
-import type { ChatThread, ChatTurn, DocumentOutlineItem, PdfAnnotation, Source } from './services/api';
+import type { ChatThread, ChatTurn, DocumentOutlineItem, ModelOption, PdfAnnotation, Source } from './services/api';
 import OnlinePaperSearch, { type OnlinePaperAttachment } from './components/OnlinePaperSearch';
 import ReferenceSources, { ReferencePanel, type ReferenceFile } from './components/ReferenceSources';
-import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocumentOutline, getDocumentAnnotations, createDocumentAnnotation, deleteDocumentAnnotation, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary, enrichDocumentMetadata, updateDocumentMetadata } from './services/api';
+import { chatStream, listChatThreads, createChatThread, getChatThread, renameChatThread, deleteChatThread, parseFileOnly, getDocumentFileUrl, getDocumentView, getDocumentOutline, getDocumentAnnotations, createDocumentAnnotation, deleteDocumentAnnotation, getAvailableModels, getDocuments, uploadDocument, reindexDocument, replaceDocument, getFolders, createFolder, renameFolder, deleteFolder, batchOperateDocuments, searchDocuments, updateDocumentAccess, toggleDocumentFavorite, generateDocumentSummary, enrichDocumentMetadata, updateDocumentMetadata } from './services/api';
 import IngestionStatus, { isIngestionPending } from './components/IngestionStatus';
 import SectionReader from './components/SectionReader';
 import PaperProfile from './components/PaperProfile';
@@ -19,6 +19,13 @@ import type { PdfNavigation, PdfPageJump } from './components/PdfReferencePrevie
 const PdfReferencePreview = React.lazy(() => import('./components/PdfReferencePreview'));
 const noPdfSources: Source[] = [];
 type PdfDirectoryItem = PdfPageJump & { level: number };
+const fallbackModels: ModelOption[] = [
+  { id: 'deepseek-flash', label: 'DeepSeek Flash', provider: 'deepseek', model: 'deepseek-flash', local: false, configured: true },
+  { id: 'qwen:qwen-plus', label: '通义千问 Plus', provider: 'qwen', model: 'qwen-plus', local: false, configured: false },
+  { id: 'moonshot:kimi', label: 'Kimi（Moonshot）', provider: 'moonshot', model: 'moonshot-v1-8k', local: false, configured: false },
+  { id: 'openai:gpt', label: 'OpenAI GPT', provider: 'openai', model: 'gpt-4o-mini', local: false, configured: false },
+  { id: 'ollama:local', label: '本地 Ollama', provider: 'ollama', model: 'qwen2.5:7b', local: true, configured: false },
+];
 type AnnotationHistoryEntry =
   | { type: 'create'; id: string }
   | { type: 'delete'; annotation: PdfAnnotation };
@@ -48,14 +55,19 @@ interface Message {
 
 function presentAnswer(content: string) {
   // Hide legacy operational notices without rewriting stored conversations.
-  return content.split('\n').filter(line => !(
+  const endOfAnswer = content.search(/^#{1,6}[ \t]+本轮(?:还未核实|核验未完成)[ \t]*$/m);
+  const visibleAnswer = endOfAnswer < 0 ? content : content.slice(0, endOfAnswer);
+  return visibleAnswer.split('\n').filter(line => !(
     /^\*\*(全文阅读|文献概览|引用定位)\*\*/.test(line)
     || /^已读取 \d+\/\d+ 个正文片段。/.test(line)
     || line === '长文已分批阅读并汇总；汇总可能省略细节，可继续针对具体章节追问。'
+    || line === '以下总结基于本轮能核验的原文，部分细节可能未覆盖。'
   )).join('\n')
-    .replace(/该项结论的原文依据不足。([ \t]*[。.!?！？])+/g, '该项结论的原文依据不足。')
-    .replace(/该项结论的原文依据不足。(\s*该项结论的原文依据不足。)+/g, '该项结论的原文依据不足。')
-    .trimStart();
+    .replace(/(\*\*通用回答\*\*|\*\*附件回答\*\*)[ \t]*·[ \t]*本轮未找到可引用的知识库证据。?(?:以下依据本次附件。)?/g, '$1')
+    .replace(/该项结论的原文依据不足。[ \t]*[。.!?！？]*|（此处原文依据不足）/g, '')
+    .replace(/^已找到指定论文，但本轮未确认能支撑这个问题的原文片段。/, '')
+    .replace(/^[ \t]*(?:[-+*]|\d+[.)])[ \t]*$/gm, '')
+    .trim();
 }
 
 function chatMessages(turns: ChatTurn[]): Message[] {
@@ -112,6 +124,11 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [ragEnabled, setRagEnabled] = useState(true);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [selectedModel, setSelectedModel] = useState<string | null>(() => {
+    try { return window.localStorage.getItem('rag-answer-model'); } catch { return null; }
+  });
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [chatAttachment, setChatAttachment] = useState<{
     filename: string; text: string; basis?: OnlinePaperAttachment['basis']; sourceUrl?: string; inLibrary?: boolean;
@@ -119,13 +136,21 @@ function App() {
   const [onlinePaperSearchOpen, setOnlinePaperSearchOpen] = useState(false);
   const [showAttachmentChoice, setShowAttachmentChoice] = useState(false);
   const [pendingAttachmentFile, setPendingAttachmentFile] = useState<File | null>(null);
-  const [recommendedQuestions] = useState([
-    { id: 1, title: '快速分析', content: '总结"2026行业报告"的核心观点', category: 'analysis' },
-    { id: 2, title: '关联搜索', content: '目前库里有哪些关于"向量数据库"的内容？', category: 'search' },
-    { id: 3, title: '知识问答', content: '什么是RAG技术？它的工作原理是什么？', category: 'knowledge' },
-    { id: 4, title: '文档查询', content: '2026行业报告中关于低空经济的部分有哪些内容？', category: 'document' }
-  ]);
   const [documents, setDocuments] = useState<Document[]>([]);
+  const [indexedDocuments, setIndexedDocuments] = useState<Document[] | null>(null);
+  const [indexCountUnavailable, setIndexCountUnavailable] = useState(false);
+  const showChatWelcome = activeTab === 'ask' && messages.length === 0 && !historyLoading;
+  const [firstPaper, secondPaper] = indexedDocuments ?? [];
+  const recommendedQuestions = [
+    { title: '全库概览', content: '知识库里的文献主要研究哪些主题？每个主题有哪些代表论文？' },
+    { title: '找相关论文', content: '知识库里有哪些论文讨论了模型评估？它们分别评估什么？' },
+    { title: '单篇精读', content: firstPaper
+      ? `《${firstPaper.metadata.filename}》用了什么研究方法？请给出原文出处。`
+      : '这篇论文用了什么研究方法？请给出原文出处。', disabled: !firstPaper },
+    { title: '跨篇比较', content: firstPaper && secondPaper
+      ? `比较《${firstPaper.metadata.filename}》和《${secondPaper.metadata.filename}》的研究方法和主要发现，并分别标注出处。`
+      : '比较两篇论文的研究方法和主要发现，并分别标注出处。', disabled: !secondPaper },
+  ];
   const [folders, setFolders] = useState<Folder[]>([]);
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
@@ -203,7 +228,6 @@ function App() {
   const [filePermission, setFilePermission] = useState('private'); // private, shared, public
   const [sortBy, setSortBy] = useState('uploaded_at'); // uploaded_at, filename, size
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc'); // asc, desc
-  const [fileTypeFilter, setFileTypeFilter] = useState('all'); // all, pdf, docx, txt
   const [isFolderSelectorOpen, setIsFolderSelectorOpen] = useState(false); // 文件夹选择对话框
   const [filesToUpload, setFilesToUpload] = useState<File[]>([]); // 待上传的文件
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({}); // 上传进度
@@ -220,6 +244,21 @@ function App() {
   const docxContainerRef = useRef<HTMLDivElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    const apply = (list: ModelOption[]) => {
+      if (!active) return;
+      const options = list.length ? list : fallbackModels;
+      setModels(options);
+      const configured = options.find(item => item.configured) ?? options[0];
+      setSelectedModel(previous => previous && options.some(item => item.id === previous && item.configured)
+        ? previous : configured?.id ?? null);
+      setModelsLoading(false);
+    };
+    void getAvailableModels().then(apply).catch(() => apply(fallbackModels));
+    return () => { active = false; };
+  }, []);
 
   // 加载文档列表
   useEffect(() => {
@@ -279,6 +318,28 @@ function App() {
       clearTimeout(timer);
     };
   }, [hasPendingIngestion]);
+
+  useEffect(() => {
+    if (!showChatWelcome) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refreshIndexCount = async () => {
+      try {
+        // The management list may be filtered by folder, type or search.
+        const library = await getDocuments();
+        if (cancelled) return;
+        setIndexedDocuments(library.filter(doc => doc.metadata.searchable === true));
+        setIndexCountUnavailable(false);
+        if (library.some(doc => isIngestionPending(doc.metadata.status))) {
+          timer = setTimeout(refreshIndexCount, 1500);
+        }
+      } catch {
+        if (!cancelled) setIndexCountUnavailable(true);
+      }
+    };
+    void refreshIndexCount();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [showChatWelcome]);
 
   // 加载文件夹列表
   useEffect(() => {
@@ -727,10 +788,19 @@ function App() {
       onOk: async () => {
         try {
           // 调用批量删除API
+          const deleting = new Set(selectedDocuments);
           await batchOperateDocuments('delete', selectedDocuments);
 
           // 重新加载文档列表，保持当前的搜索和筛选状态
           await handleSearch();
+          setRecentDocuments(previous => previous.filter(item => !deleting.has(item.id)));
+          setFavoriteDocuments(previous => previous.filter(item => !deleting.has(item.id)));
+          if (selectedDocument && deleting.has(selectedDocument.id)) {
+            setIsDrawerOpen(false);
+            setSelectedDocument(null);
+            setDocumentView(null);
+            setAnnotations([]);
+          }
 
           // 清空选中状态
           setSelectedDocuments([]);
@@ -746,6 +816,36 @@ function App() {
   };
 
 
+
+  const handleDeleteDocument = (doc: Document) => {
+    Modal.confirm({
+      title: '删除文献',
+      content: `确定删除《${documentTitle(doc)}》吗？原文件、索引和批注都会删除，无法恢复。`,
+      okText: '删除',
+      cancelText: '取消',
+      okType: 'danger',
+      onOk: async () => {
+        try {
+          await batchOperateDocuments('delete', [doc.id]);
+          setSelectedDocuments(previous => previous.filter(id => id !== doc.id));
+          setRecentDocuments(previous => previous.filter(item => item.id !== doc.id));
+          setFavoriteDocuments(previous => previous.filter(item => item.id !== doc.id));
+          if (selectedDocument?.id === doc.id) {
+            setIsDrawerOpen(false);
+            setSelectedDocument(null);
+            setDocumentView(null);
+            setAnnotations([]);
+          }
+          await handleSearch();
+          message.success('文献已删除');
+        } catch (error) {
+          console.error('Error deleting document:', error);
+          message.error(`删除文献失败：${error instanceof Error ? error.message : '未知错误'}`);
+          throw error;
+        }
+      },
+    });
+  };
 
   // 处理文件选择，打开文件夹选择对话框
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -965,7 +1065,7 @@ function App() {
       const results = await searchDocuments(
         searchQuery,
         effectiveFolderId || undefined,
-        fileTypeFilter === 'all' ? undefined : fileTypeFilter,
+        undefined,
         sortBy,
         sortOrder
       );
@@ -1265,6 +1365,7 @@ function App() {
         () => setMessages(previous => previous.map(reply =>
           reply.id === replyId ? { ...reply, verifyingCitations: true } : reply
         )),
+        selectedModel ?? undefined,
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : '问答请求失败，请稍后重试。';
@@ -1464,13 +1565,6 @@ function App() {
                 <Icon icon="solar:database-bold-duotone" className={activeTab === 'knowledge' ? 'text-brand-600 dark:text-brand-400' : ''} />
                 <span className="font-medium">知识库</span>
               </button>
-              <button
-                className={`w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg transition-all ${activeTab === 'write' ? 'bg-brand-100 dark:bg-brand-900/30 text-brand-600 dark:text-brand-400' : 'text-gray-600 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-slate-800'}`}
-                onClick={() => handleTabSwitch('write')}
-              >
-                <Icon icon="solar:pen-2-line-duotone" className={activeTab === 'write' ? 'text-brand-600 dark:text-brand-400' : ''} />
-                <span className="font-medium">创作中心</span>
-              </button>
             </div>
 
             {activeTab === 'ask' && (
@@ -1559,16 +1653,6 @@ function App() {
               </div>
             </div>
 
-            {/* 标签云 */}
-            <div className="pt-6 pb-6">
-              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 px-3">知识标签</h3>
-              <div className="flex flex-wrap gap-2 px-3">
-                <span className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded text-[10px] font-medium cursor-pointer hover:bg-brand-100 dark:hover:bg-brand-900/30 hover:text-brand-600 transition-colors">#人工智能</span>
-                <span className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded text-[10px] font-medium cursor-pointer hover:bg-brand-100 dark:hover:bg-brand-900/30 hover:text-brand-600 transition-colors">#经济学</span>
-                <span className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded text-[10px] font-medium cursor-pointer hover:bg-brand-100 dark:hover:bg-brand-900/30 hover:text-brand-600 transition-colors">#RAG落地</span>
-                <span className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded text-[10px] font-medium cursor-pointer hover:bg-brand-100 dark:hover:bg-brand-900/30 hover:text-brand-600 transition-colors">#低空经济</span>
-              </div>
-            </div>
           </div>
         </aside>
 
@@ -1592,13 +1676,20 @@ function App() {
                     <div className="w-20 h-20 bg-brand-50 dark:bg-brand-900/20 rounded-3xl flex items-center justify-center group">
                       <Icon icon="solar:magic-stick-3-bold-duotone" className="text-5xl text-brand-600 transition-transform group-hover:scale-110" />
                     </div>
-                    <h2 className="text-3xl font-bold">你好，我是你的知识助手</h2>
-                    <p className="text-gray-500 max-w-md">已索引 1,284 篇文档。你可以像聊天一样询问我任何知识，我会提供基于原文的准确回答。</p>
-                    <div className="grid grid-cols-2 gap-3 w-full max-w-lg mt-6 text-left">
+                    <h2 className="text-3xl font-bold">你好，我是你的文献助手</h2>
+                    <p className="max-w-md text-gray-500" aria-live="polite">
+                      {indexCountUnavailable ? '暂时无法读取索引数量。'
+                        : indexedDocuments === null ? '正在读取索引状态…'
+                        : indexedDocuments.length === 0 ? '已索引 0 篇文献。请先到知识库导入文献。'
+                        : `已索引 ${indexedDocuments.length.toLocaleString('zh-CN')} 篇文献。可以按主题找论文、比较研究方法或追查原文。`}
+                    </p>
+                    <div className="mt-6 grid w-full max-w-lg grid-cols-1 gap-3 text-left sm:grid-cols-2">
                       {recommendedQuestions.map((question) => (
                         <button
-                          key={question.id}
-                          className="p-3 border border-gray-200 dark:border-slate-800 rounded-xl hover:bg-brand-50 dark:hover:bg-brand-900/20 transition-all group"
+                          key={question.title}
+                          type="button"
+                          disabled={historyLoading || indexCountUnavailable || !indexedDocuments?.length || question.disabled}
+                          className="rounded-xl border border-gray-200 p-3 text-left transition-colors enabled:hover:bg-brand-50 disabled:opacity-50 dark:border-slate-800 dark:enabled:hover:bg-brand-900/20"
                           onClick={() => void sendQuestion(question.content)}
                         >
                           <p className="text-xs font-semibold text-brand-600 mb-1">{question.title}</p>
@@ -1645,7 +1736,8 @@ function App() {
                                       }}>{number}</a>;
                                   },
                                 }}>
-                                  {message.complete === false ? formatStreamingMarkdown(presentAnswer(message.content)) : presentAnswer(message.content)}
+                                  {message.complete === false ? formatStreamingMarkdown(presentAnswer(message.content))
+                                    : presentAnswer(message.content) || '可以指定想看的章节、实验或指标，我再帮你查阅。'}
                                 </ReactMarkdown>
                               )}
                               {message.verifyingCitations && (
@@ -1760,11 +1852,30 @@ function App() {
                         </Tooltip>
                       </div>
                       <div className="ml-auto flex min-w-0 items-center gap-1.5">
-                        <span className="flex min-w-0 items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium text-slate-600 dark:text-slate-300"
-                          title="当前模型：DeepSeek Flash">
-                          <Icon icon="simple-icons:deepseek" className="shrink-0 text-sm" aria-hidden="true" />
-                          <span className="truncate">DeepSeek Flash</span>
-                        </span>
+                        <Select
+                          size="small"
+                          variant="borderless"
+                          value={selectedModel ?? undefined}
+                          onChange={value => {
+                            const target = models.find(item => item.id === value);
+                            if (!target?.configured) {
+                              message.warning(`${target?.label ?? '该模型'}尚未配置，请先设置对应的 API 密钥或启动本地服务。`);
+                              return;
+                            }
+                            setSelectedModel(value);
+                            try { window.localStorage.setItem('rag-answer-model', value); } catch { /* ignore */ }
+                          }}
+                          options={models.map(model => ({
+                            value: model.id,
+                            label: `${model.label}${model.configured ? '' : '（需配置）'}`,
+                          }))}
+                          placeholder={modelsLoading ? '加载模型…' : '选择模型'}
+                          notFoundContent={modelsLoading ? '加载中…' : '暂无模型'}
+                          loading={modelsLoading}
+                          popupMatchSelectWidth={false}
+                          style={{ minWidth: 120, maxWidth: 190 }}
+                          title="回答模型；路由与引用核验使用默认模型"
+                        />
                         <Tooltip title={ragEnabled ? '关闭知识库检索' : '开启知识库检索'} trigger={['hover', 'focus']}>
                           <button type="button" aria-label="知识库检索" aria-pressed={ragEnabled}
                             className={`flex h-8 shrink-0 items-center gap-1 rounded-full border px-2 text-xs font-medium transition-colors ${ragEnabled
@@ -2024,21 +2135,6 @@ function App() {
                             />
                           </button>
                         </div>
-                        {/* 文件类型筛选 */}
-                        <select
-                          value={fileTypeFilter}
-                          onChange={(e) => {
-                            setFileTypeFilter(e.target.value);
-                            handleSearch();
-                          }}
-                          className="px-2 py-1 bg-gray-100 dark:bg-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
-                        >
-                          <option value="all">所有类型</option>
-                          <option value=".pdf">PDF</option>
-                          <option value=".docx">DOCX</option>
-                          <option value=".txt">TXT</option>
-                          <option value=".md">MD</option>
-                        </select>
                         {/* 自动补全元数据 */}
                         <button
                           type="button"
@@ -2180,16 +2276,25 @@ function App() {
                                       <h5 className="truncate text-sm font-medium">{documentTitle(doc)}</h5>
                                       <p className="truncate text-xs text-gray-400">{doc.metadata.filename}</p>
                                     </div>
-                                    <button
-                                      className="rounded-full p-1 transition-colors hover:bg-gray-200 dark:hover:bg-slate-700"
-                                      onClick={event => { event.stopPropagation(); void toggleFavoriteDocument(doc); }}
-                                      title={doc.metadata.is_favorite ? '取消收藏' : '收藏'}
-                                    >
-                                      <Icon
-                                        icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'}
-                                        className={doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-400 dark:text-slate-500'}
-                                      />
-                                    </button>
+                                    <div className="flex items-center gap-0.5">
+                                      <button
+                                        className="rounded-full p-1 transition-colors hover:bg-gray-200 dark:hover:bg-slate-700"
+                                        onClick={event => { event.stopPropagation(); void toggleFavoriteDocument(doc); }}
+                                        title={doc.metadata.is_favorite ? '取消收藏' : '收藏'}
+                                      >
+                                        <Icon
+                                          icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'}
+                                          className={doc.metadata.is_favorite ? 'text-red-500' : 'text-gray-400 dark:text-slate-500'}
+                                        />
+                                      </button>
+                                      <button
+                                        className="rounded-full p-1 text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/20"
+                                        onClick={event => { event.stopPropagation(); handleDeleteDocument(doc); }}
+                                        title="删除文献"
+                                      >
+                                        <Icon icon="solar:trash-bin-trash-bold" />
+                                      </button>
+                                    </div>
                                   </div>
                                   <div className="mt-2 space-y-1 text-xs text-gray-500 dark:text-slate-400">
                                     <div className="flex flex-wrap gap-x-2 gap-y-1">
@@ -2215,13 +2320,13 @@ function App() {
                             <colgroup>
                               <col style={{ width: '34px' }} />
                               <col />
-                              <col style={{ width: '84px' }} />
+                              <col style={{ width: '80px' }} />
                               <col style={{ width: '56px' }} />
-                              <col style={{ width: '108px' }} />
-                              <col style={{ width: '96px' }} />
+                              <col style={{ width: '92px' }} />
+                              <col style={{ width: '84px' }} />
                               <col style={{ width: '80px' }} />
                               <col style={{ width: '88px' }} />
-                              <col style={{ width: '84px' }} />
+                              <col style={{ width: '116px' }} />
                             </colgroup>
                             <thead className="bg-gray-50 text-xs text-gray-500 dark:bg-slate-900/60 dark:text-slate-400">
                               <tr>
@@ -2317,6 +2422,14 @@ function App() {
                                         >
                                           <Icon icon={doc.metadata.is_favorite ? 'solar:heart-bold' : 'solar:heart-linear'} />
                                         </button>
+                                        <button
+                                          type="button"
+                                          title="删除文献"
+                                          onClick={() => handleDeleteDocument(doc)}
+                                          className="rounded p-1.5 text-gray-500 transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/20"
+                                        >
+                                          <Icon icon="solar:trash-bin-trash-bold" />
+                                        </button>
                                         <Dropdown
                                           trigger={['click']}
                                           menu={{
@@ -2395,36 +2508,6 @@ function App() {
             </div>
           )}
 
-          {/* 场景3：创作中心 Area */}
-          {activeTab === 'write' && (
-            <div className="flex-1 flex flex-col h-full p-6 md:px-20">
-              <div className="flex items-center space-x-4 mb-6">
-                <button
-                  className="flex items-center space-x-1 text-sm text-gray-500 hover:text-brand-600 transition-colors"
-                  onClick={() => setActiveTab('ask')}
-                >
-                  <Icon icon="solar:alt-arrow-left-bold" />
-                  <span>返回问答</span>
-                </button>
-                <div className="h-4 w-px bg-gray-200 dark:bg-slate-800"></div>
-                <h3 className="text-sm font-bold flex items-center space-x-2">
-                  <Icon icon="solar:pen-2-line-duotone" className="text-brand-600" />
-                  <span>创作中心</span>
-                </h3>
-              </div>
-              <div className="bg-white dark:bg-slate-800 rounded-xl shadow-md border border-gray-200 dark:border-slate-700 p-6">
-                <h4 className="text-lg font-bold mb-4">文档创作</h4>
-                <p className="text-gray-500 mb-6">创作中心功能正在开发中，敬请期待！</p>
-                <button
-                  className="px-4 py-2 bg-brand-600 text-white rounded-lg text-sm font-bold flex items-center space-x-1 transition-all hover:shadow-md hover:bg-brand-700"
-                  onClick={() => setActiveTab('ask')}
-                >
-                  <Icon icon="solar:message-circle-bold" />
-                  <span>返回智能问答</span>
-                </button>
-              </div>
-            </div>
-          )}
         </main>
 
       </div>

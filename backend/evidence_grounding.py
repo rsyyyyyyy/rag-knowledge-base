@@ -159,9 +159,6 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
     entries, seen, replacements = [], {}, {}
     for index, match in enumerate(matches):
         source = by_number.get(int(match[1]))
-        if source is None:
-            replacements[index] = '（此处原文依据不足）'
-            continue
         start = answer.rfind('\n\n', 0, match.start()) + 2
         if start == 1: start = 0
         prefix = LINK.sub('', answer[start:match.start()]).strip()
@@ -172,10 +169,10 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
             if len(tail) >= 4: prefix = tail
         sentences = [s.strip() for s in re.split(r'(?<=[。！？])\s*|(?<=[.!?])\s+(?=[A-Z\u4e00-\u9fff])|\n', prefix) if s.strip()]
         block = (sentences[-1] if sentences else prefix)[-1600:]
-        key = (block, source.get('chunk_id'), source.get('excerpt_start', 0))
+        key = (block, source.get('chunk_id'), source.get('excerpt_start', 0)) if source else (block, int(match[1]))
         if key not in seen:
-            candidates = expand(source) if expand else [source]
-            candidates = candidates or [source]
+            candidates = (expand(source) if expand else [source]) if source else []
+            candidates = candidates or ([source] if source else [])
             # Only actual passages, never summary notes, enter this evidence check.
             seen[key] = len(entries)
             entries.append({'ref': str(len(entries)), 'claim_context': block,
@@ -187,6 +184,8 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
     tokens, accepted, audit = 0, {}, {'checked': len(matches), 'verified': 0, 'unsupported': len(replacements), 'supplemental_reads': 0}
     batches, batch, size = [], [], 0
     for entry in entries:
+        if not entry['_candidates']:
+            continue
         cost = len(json.dumps({k:v for k,v in entry.items() if not k.startswith('_')}, ensure_ascii=False).encode())
         if batch and (size + cost > 22000 or len(batch) >= 6):
             batches.append(batch)
@@ -273,7 +272,7 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
     def assertion_key(entry):
         return normalized(entry['claim_context']).rstrip('。.;；,，')
     supported_assertions = {assertion_key(entry) for entry in entries if entry['ref'] in accepted}
-    claim_edits, edited_assertions = [], set()
+    claim_edits, removed_citations = [], set()
     for entry in entries:
         evidence = accepted.get(entry['ref'])
         if evidence:
@@ -292,19 +291,27 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
             # A redundant bad reference does not invalidate a claim that has another
             # verified, directly supporting quote. A wholly unsupported claim must
             # not keep asserting its original numbers as though they were facts.
-            replacement = '' if key in supported_assertions or key in edited_assertions else '（此处原文依据不足）'
-            if key not in supported_assertions and key not in edited_assertions:
-                occurrence = matches[entry['_occurrences'][0]]
-                begin = answer.rfind(entry['claim_context'], 0, occurrence.start())
-                finish = begin + len(entry['claim_context'])
-                if begin >= 0 and not any(begin < r and finish > l for l, r, _ in claim_edits):
-                    claim_edits.append((begin, finish, '该项结论的原文依据不足。'))
-                    edited_assertions.add(key)
-                    replacement = ''
+            replacement = ''
+            if key not in supported_assertions:
+                for index in entry['_occurrences']:
+                    occurrence = matches[index]
+                    block = entry['claim_context']
+                    begin = answer.rfind(block, 0, occurrence.start()) if block else -1
+                    finish = begin + len(block)
+                    if begin >= 0 and (begin, finish, '') not in claim_edits:
+                        claim_edits.append((begin, finish, ''))
+                    removed_citations.add(index)
             audit['unsupported'] += len(entry['_occurrences'])
         for occurrence in entry['_occurrences']: replacements[occurrence] = replacement
     pieces, cursor = [], 0
-    edits = claim_edits + [(match.start(), match.end(), replacements[index]) for index, match in enumerate(matches)]
+    edits = list(claim_edits)
+    for index, match in enumerate(matches):
+        end = match.end()
+        if index in removed_citations:
+            punctuation = re.match(r'[ \t]*[。.!?！？；;，,]+', answer[end:])
+            if punctuation:
+                end += punctuation.end()
+        edits.append((match.start(), end, replacements[index]))
     for begin, finish, replacement in sorted(edits):
         if begin < cursor: continue
         pieces.extend([answer[cursor:begin], replacement])
@@ -312,7 +319,5 @@ def ground_answer(answer, sources, question, client, model, expand=None, repair=
     pieces.append(answer[cursor:])
     selected.extend(s for s in sources if s['id'] == 'attachment')
     final = deduplicate_citation_groups(''.join(pieces))
-    notice = '该项结论的原文依据不足。'
-    final = re.sub(rf'{re.escape(notice)}(?:[ \t]*[。.!?！？])+', notice, final)
-    final = re.sub(rf'{re.escape(notice)}(?:\s*{re.escape(notice)})+', notice, final)
+    final = re.sub(r'(?m)^[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]*)$', '', final).strip()
     return final, selected, tokens, audit

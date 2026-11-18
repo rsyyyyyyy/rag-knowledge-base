@@ -50,7 +50,11 @@ class RetrievalIntegrationTest(TestCase):
                 import app
 
                 self.assertEqual(app.DATA_DIR, Path(directory).resolve())
-                with TestClient(app.app) as client:
+                # Model calls are mocked below; discovery must also be independent
+                # of API keys and locally running Ollama instances.
+                configured_model = SimpleNamespace(model=app.DEEPSEEK_MODEL, label="Test model",
+                                                   provider="deepseek", extra_body=None)
+                with TestClient(app.app) as client, patch("app.resolve_model", return_value=configured_model):
                     self.exercise(client)
             finally:
                 if previous_auto_profile is None:
@@ -363,8 +367,53 @@ class RetrievalIntegrationTest(TestCase):
         self.assertEqual(evidence[1]["version_id"], hashlib.sha256(original).hexdigest())
         self.assertTrue(evidence[1]["rects"])
 
-        import app
+        from question_router import EvidenceAspect
         from literature_tools import LiteratureTools
+
+        def coverage_review(**kwargs):
+            payload = json.loads(kwargs['messages'][-1]['content'])
+            rows = []
+            for item in payload['items']:
+                eligible = [s for s in payload['passages'] if s['number'] in item['allowed_passages']]
+                row = {'id': item['id'], 'coverage': 'missing', 'facts': [], 'search_query': 'battery duration'}
+                expected = 37 if item['document_id'] == aurora else 23
+                source = next((s for s in eligible if f'{expected} hours' in s['text']), None)
+                if source:
+                    quote = source['text']
+                    row.update(coverage='full', facts=[{'text': f'电池持续 {expected} 小时。',
+                                                        'passage': source['number'], 'quote': quote}])
+                rows.append(row)
+            return reply(json.dumps({'items': rows}, ensure_ascii=False))
+
+        targeted_calls = []
+        read_for_coverage = LiteratureTools.read_for_coverage
+
+        def record_target(registry, query, document_id):
+            targeted_calls.append(document_id)
+            return read_for_coverage(registry, query, document_id)
+
+        with patch.dict(os.environ, {'RAG_LITERATURE_TOOLS': '1'}), patch('app.get_deepseek_client') as factory, patch(
+            'app.plan_question', return_value=(QuestionPlan(route='evidence', reading_mode='local', compare_papers=True,
+                evidence_aspects=[EvidenceAspect(label='Aurora Protocol 的电池时长', query='battery duration'),
+                                  EvidenceAspect(label='Northwind Study 的电池时长', query='battery duration')]), 5),
+        ), patch('app.collect_tool_evidence', return_value=([evidence[1]], 3, 'selected')), patch.object(
+            LiteratureTools, 'read_for_coverage', record_target,
+        ):
+            factory.return_value.__enter__.return_value = factory.return_value
+            factory.return_value.chat.completions.create.side_effect = coverage_review
+            response = client.post('/api/chat?stream=true', json={
+                'question': '比较两篇的电池时长', 'document_ids': [aurora, northwind],
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            frames = [json.loads(line) for line in response.iter_lines()]
+            self.assertEqual([frame['type'] for frame in frames], ['heartbeat', 'text', 'sources', 'end'])
+            self.assertIn('37 小时', frames[1]['content'])
+            self.assertIn('23 小时', frames[1]['content'])
+            self.assertEqual({s['id'] for s in frames[2]['sources']}, {aurora, northwind})
+            self.assertEqual(targeted_calls, [northwind])
+            self.assertEqual([item['status'] for item in frames[-1]['diagnostics']['coverage']['items']], ['full', 'full'])
+
+        import app
         from knowledge_search import KnowledgeScope
         from openai.types.chat import ChatCompletionMessageFunctionToolCall
 

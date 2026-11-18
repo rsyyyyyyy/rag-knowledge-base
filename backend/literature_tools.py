@@ -85,6 +85,19 @@ class LiteratureTools:
         current = self.search._active(self.search._documents(self.scope))
         return {id_: version for id_, version in current.items() if self.active.get(id_) == version}
 
+    def current_versions(self):
+        with self.search.ingestion.index_lock:
+            return self._documents()
+
+    def read_for_coverage(self, query, document_id):
+        with self.search.ingestion.index_lock:
+            active = self._documents()
+            if document_id and document_id not in active:
+                return []
+            session = self._session([document_id] if document_id else active)
+            hits = session.search_knowledge(query, limit=3, mode='hybrid')
+            return session.expand_sections([hit['chunk_id'] for hit in hits], max_passages=5, per_section=3)
+
     def _session(self, ids):
         return self.search.session(self.scope.model_copy(update={'document_ids': list(ids)}))
 

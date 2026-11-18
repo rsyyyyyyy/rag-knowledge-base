@@ -523,6 +523,24 @@ export const getChatThread = (id: string) => requestChatHistory<{ turns: ChatTur
 export const renameChatThread = (id: string, title: string) => requestChatHistory<ChatThread>(`/${encodeURIComponent(id)}`, 'PATCH', { title });
 export const deleteChatThread = (id: string) => requestChatHistory<void>(`/${encodeURIComponent(id)}`, 'DELETE');
 
+export interface ModelOption {
+  id: string;
+  label: string;
+  provider: string;
+  model: string;
+  local: boolean;
+  configured: boolean;
+}
+
+export const getAvailableModels = async (): Promise<ModelOption[]> => {
+  const response = await fetch(`${API_BASE_URL}/models`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.detail || 'Failed to load models');
+  }
+  return (data.models ?? []) as ModelOption[];
+};
+
 export const chatStream = async (
   question: string,
   top_k: number = 3,
@@ -535,9 +553,11 @@ export const chatStream = async (
   threadId?: string,
   attachmentSourceUrl?: string,
   onVerifyingCitations?: () => void,
+  model?: string,
 ): Promise<void> => {
   const body: Record<string, unknown> = { question, top_k, rag_enabled };
   if (threadId) body.thread_id = threadId;
+  if (model) body.model = model;
   if (attachmentBasis) body.attachment_basis = attachmentBasis;
   if (attachmentSourceUrl) body.attachment_source_url = attachmentSourceUrl;
   if (attachmentText) body.attachment_text = attachmentText;

@@ -4,6 +4,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class EvidenceAspect(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    label: str = Field(min_length=1, max_length=80)
+    query: str = Field(min_length=1, max_length=240)
+
+
 class QuestionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     route: Literal["folders", "documents", "file_status", "overview", "evidence", "general"]
@@ -15,6 +21,8 @@ class QuestionPlan(BaseModel):
     reference_indices: list[int] = Field(default_factory=list, max_length=20, description="One-based positions in the displayed group")
     search_question: str | None = Field(default=None, max_length=4000)
     retrieval_queries: list[str] = Field(default_factory=list, max_length=3)
+    evidence_aspects: list[EvidenceAspect] = Field(default_factory=list, max_length=6)
+    compare_papers: bool = False
 
 
 PLANNER_PROMPT = """你是文献知识库的问答路由器。按用户实际想得到的信息决定应调用哪一类只读工具。
@@ -31,6 +39,8 @@ route 只能取下列值：
 询问论文中的实现机制、算法、步骤、公式或实验细节（包括‘如何实现’‘怎么更新’）属于 evidence，即使是承接概览的追问。
 为 evidence 提供最多 3 条互补的短检索词 retrieval_queries，优先保留论文原文术语、英文展开和当前所问细节。中文提问涉及英文论文时，至少一条使用对应的精确英文术语。
 每条针对一个子问题或同义表述，省略文件名和宽泛套话。不确定的机制不能当成事实写入查询。其他路由填空数组。
+给 evidence 增加 evidence_aspects 数组，每项为 {"label":"用户要核对的具体要点","query":"用于查找原文的术语"}，最多6项。简单问题一项；按多个维度提问时逐项列出。要求列举某个流程的全部阶段、但阶段名未知时，将完整阶段列表作为一个要点，不能猜测阶段。只找论文名称或罗列候选时留空。
+多篇论文按数据集、方法、结论等具体维度对比时选 evidence、reading_mode=local、compare_papers=true。evidence_aspects 只列双方共用的具体维度，每个维度只出现一次，label 和 query 均不得带论文名称。用户只问两篇的核心研究方法时，唯一要点是 {"label":"核心研究方法","query":"proposed framework methodology"}，无需分别创建两篇论文的要点或附加“比较维度”。后端会为各篇分别取证。明确要求全文通读或没有具体维度的整体比较仍用原全文流程。其他问题 compare_papers=false。
 只在用户明确提到库内文件夹或文献对象时提取标识，保持问题中名称和扩展名；用完整路径时照录。
 只有用户明确把名称当作文献、论文、文件名或标题使用时，才填写 document_names。协议、模型、实验和主题名称本身由 evidence 在正文里查找，不是文献名。
 例如“青松协议报告了多长的运行时间？”选 evidence 且 document_names 为空，“解释什么是向量数据库”选 general。不要猜测名称或 ID。无指定对象时两个名称数组为空。
@@ -77,7 +87,7 @@ def plan_question(client, model, question, history=None, catalog=None):
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
         response_format={"type": "json_object"},
-        max_tokens=760 if history else 480,
+        max_tokens=1300 if history else 1100,
         temperature=0,
         extra_body={"thinking": {"type": "disabled"}},
     )
